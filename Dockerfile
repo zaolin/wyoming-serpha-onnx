@@ -53,7 +53,7 @@ RUN cp -r /build/sherpa-onnx/build/bin/* /usr/local/bin/ && \
 
 # Install Python sherpa-onnx from source build
 RUN cd /build/sherpa-onnx && \
-    pip3 install --no-cache-dir --break-system-packages .
+    pip3 install --no-cache-dir .
 
 # Clean up build directory to reduce image size
 RUN rm -rf /build
@@ -66,11 +66,11 @@ COPY pyproject.toml /app/
 COPY wyoming_sherpa_onnx/ /app/wyoming_sherpa_onnx/
 
 # Install Wyoming handler and dependencies
-RUN pip3 install --no-cache-dir --break-system-packages \
+RUN pip3 install --no-cache-dir \
     wyoming>=1.5.0 \
     numpy>=1.24.0 \
     soundfile>=0.12.0 \
-    && pip3 install --no-cache-dir --break-system-packages -e /app
+    && pip3 install --no-cache-dir -e /app
 
 # Create directories for models
 RUN mkdir -p /app/models/asr /app/models/tts
