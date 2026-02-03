@@ -3,7 +3,7 @@
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -42,12 +42,156 @@ class TTSConfig:
     speed: float = 1.0
 
 
+def _find_file(model_path: Path, patterns: list[str]) -> Optional[Path]:
+    """Find first file matching any of the patterns."""
+    for pattern in patterns:
+        matches = list(model_path.glob(pattern))
+        if matches:
+            return matches[0]
+    return None
+
+
+def _find_tokens(model_path: Path, base_name: Optional[str] = None) -> Optional[Path]:
+    """Find tokens file with various naming conventions."""
+    patterns = ["tokens.txt"]
+    if base_name:
+        # Handle naming like large-v3-tokens.txt
+        patterns.insert(0, f"{base_name}-tokens.txt")
+        patterns.insert(0, f"{base_name.replace('-encoder', '')}-tokens.txt")
+    
+    for pattern in patterns:
+        tokens_file = model_path / pattern
+        if tokens_file.exists():
+            return tokens_file
+    
+    # Try glob patterns
+    matches = list(model_path.glob("*-tokens.txt"))
+    if matches:
+        return matches[0]
+    
+    return None
+
+
 class SherpaASREngine:
-    """Sherpa-onnx ASR engine wrapper."""
+    """Sherpa-onnx ASR engine wrapper supporting multiple model types."""
 
     def __init__(self, config: ASRConfig) -> None:
         self.config = config
         self._recognizer = None
+
+    def _detect_model_type(self, model_path: Path) -> Tuple[str, dict]:
+        """
+        Detect model type and return (type_name, config_dict).
+        
+        Supports:
+        - SenseVoice: model.onnx or model.int8.onnx
+        - Whisper: *-encoder.onnx + *-decoder.onnx or encoder.onnx + decoder.onnx
+        - Moonshine: preprocessor.onnx + encoder.onnx + uncached_decoder.onnx + cached_decoder.onnx
+        - Transducer: encoder.onnx + decoder.onnx + joiner.onnx
+        - Paraformer: model.onnx (with specific config)
+        - CTC (NeMo/WeNet/Zipformer): model.onnx
+        """
+        
+        # Check for Moonshine (has unique preprocessor.onnx)
+        preprocessor = _find_file(model_path, ["preprocessor.onnx", "*preprocessor*.onnx"])
+        if preprocessor:
+            encoder = _find_file(model_path, ["encoder.onnx", "*-encoder.onnx"])
+            uncached_decoder = _find_file(model_path, ["uncached_decoder.onnx", "*uncached*.onnx"])
+            cached_decoder = _find_file(model_path, ["cached_decoder.onnx", "*cached_decoder*.onnx"])
+            tokens = _find_tokens(model_path)
+            
+            if encoder and uncached_decoder and cached_decoder and tokens:
+                return "moonshine", {
+                    "preprocessor": str(preprocessor),
+                    "encoder": str(encoder),
+                    "uncached_decoder": str(uncached_decoder),
+                    "cached_decoder": str(cached_decoder),
+                    "tokens": str(tokens),
+                }
+        
+        # Check for Transducer (has joiner.onnx)
+        joiner = _find_file(model_path, ["joiner.onnx", "*-joiner.onnx", "*joiner*.onnx"])
+        if joiner:
+            encoder = _find_file(model_path, ["encoder.onnx", "*-encoder.onnx"])
+            decoder = _find_file(model_path, ["decoder.onnx", "*-decoder.onnx"])
+            tokens = _find_tokens(model_path)
+            
+            if encoder and decoder and tokens:
+                return "transducer", {
+                    "encoder": str(encoder),
+                    "decoder": str(decoder),
+                    "joiner": str(joiner),
+                    "tokens": str(tokens),
+                }
+        
+        # Check for Whisper (encoder + decoder, no joiner)
+        # Try various naming patterns
+        encoder = _find_file(model_path, [
+            "encoder.onnx", "encoder.int8.onnx",
+            "*-encoder.onnx", "*-encoder.int8.onnx",
+            "tiny-encoder.onnx", "base-encoder.onnx", "small-encoder.onnx",
+            "medium-encoder.onnx", "large-encoder.onnx", "large-v*-encoder*.onnx",
+        ])
+        
+        if encoder:
+            # Derive decoder name from encoder
+            decoder_name = encoder.name.replace("-encoder", "-decoder").replace("encoder", "decoder")
+            decoder = model_path / decoder_name
+            if not decoder.exists():
+                decoder = _find_file(model_path, ["decoder.onnx", "*-decoder.onnx", "*-decoder.int8.onnx"])
+            
+            if decoder and decoder.exists():
+                # Check it's not a transducer (no joiner)
+                if not joiner:
+                    base_name = encoder.stem.replace("-encoder", "").replace(".int8", "")
+                    tokens = _find_tokens(model_path, base_name)
+                    
+                    if tokens:
+                        return "whisper", {
+                            "encoder": str(encoder),
+                            "decoder": str(decoder),
+                            "tokens": str(tokens),
+                        }
+        
+        # Check for SenseVoice (model.onnx with sense/voice in path name)
+        model_onnx = _find_file(model_path, ["model.onnx", "model.int8.onnx"])
+        tokens = _find_tokens(model_path)
+        
+        if model_onnx and tokens:
+            # Determine type by directory name or file patterns
+            path_lower = str(model_path).lower()
+            
+            if "sense" in path_lower or "funaudio" in path_lower:
+                return "sensevoice", {
+                    "model": str(model_onnx),
+                    "tokens": str(tokens),
+                }
+            
+            if "paraformer" in path_lower:
+                return "paraformer", {
+                    "model": str(model_onnx),
+                    "tokens": str(tokens),
+                }
+            
+            if "nemo" in path_lower or "ctc" in path_lower or "wenet" in path_lower:
+                return "ctc", {
+                    "model": str(model_onnx),
+                    "tokens": str(tokens),
+                }
+            
+            # Default: try SenseVoice first (most common single-model format)
+            return "sensevoice", {
+                "model": str(model_onnx),
+                "tokens": str(tokens),
+            }
+        
+        # List available files for debugging
+        onnx_files = list(model_path.glob("*.onnx"))
+        txt_files = list(model_path.glob("*.txt"))
+        _LOGGER.error("Available ONNX files: %s", [f.name for f in onnx_files])
+        _LOGGER.error("Available TXT files: %s", [f.name for f in txt_files])
+        
+        raise ValueError(f"Could not detect ASR model type in {model_path}")
 
     async def load(self) -> None:
         """Load the ASR model."""
@@ -55,57 +199,80 @@ class SherpaASREngine:
 
         _LOGGER.info("Loading ASR model from %s", self.config.model_path)
 
-        # Detect model type based on files present
-        model_path = self.config.model_path
-
-        # Check for SenseVoice model
-        sense_voice_model = model_path / "model.onnx"
-        if sense_voice_model.exists():
-            _LOGGER.info("Detected SenseVoice model")
+        model_type, config = self._detect_model_type(self.config.model_path)
+        provider = self.config.provider if self.config.use_gpu else "cpu"
+        
+        _LOGGER.info("Detected %s model", model_type)
+        
+        if model_type == "sensevoice":
             self._recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
-                model=str(sense_voice_model),
-                tokens=str(model_path / "tokens.txt"),
+                model=config["model"],
+                tokens=config["tokens"],
                 use_itn=True,
                 num_threads=self.config.num_threads,
-                provider=self.config.provider if self.config.use_gpu else "cpu",
+                provider=provider,
             )
-            return
-
-        # Check for Whisper model
-        encoder = model_path / "encoder.onnx"
-        decoder = model_path / "decoder.onnx"
-        if encoder.exists() and decoder.exists():
-            _LOGGER.info("Detected Whisper model")
+        
+        elif model_type == "whisper":
             self._recognizer = sherpa_onnx.OfflineRecognizer.from_whisper(
-                encoder=str(encoder),
-                decoder=str(decoder),
-                tokens=str(model_path / "tokens.txt"),
+                encoder=config["encoder"],
+                decoder=config["decoder"],
+                tokens=config["tokens"],
                 num_threads=self.config.num_threads,
-                provider=self.config.provider if self.config.use_gpu else "cpu",
+                provider=provider,
             )
-            return
-
-        # Check for transducer model (streaming)
-        transducer_encoder = model_path / "encoder.onnx"
-        transducer_decoder = model_path / "decoder.onnx"
-        transducer_joiner = model_path / "joiner.onnx"
-        if (
-            transducer_encoder.exists()
-            and transducer_decoder.exists()
-            and transducer_joiner.exists()
-        ):
-            _LOGGER.info("Detected Transducer model")
+        
+        elif model_type == "moonshine":
+            self._recognizer = sherpa_onnx.OfflineRecognizer.from_moonshine(
+                preprocessor=config["preprocessor"],
+                encoder=config["encoder"],
+                uncached_decoder=config["uncached_decoder"],
+                cached_decoder=config["cached_decoder"],
+                tokens=config["tokens"],
+                num_threads=self.config.num_threads,
+                provider=provider,
+            )
+        
+        elif model_type == "transducer":
             self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
-                encoder=str(transducer_encoder),
-                decoder=str(transducer_decoder),
-                joiner=str(transducer_joiner),
-                tokens=str(model_path / "tokens.txt"),
+                encoder=config["encoder"],
+                decoder=config["decoder"],
+                joiner=config["joiner"],
+                tokens=config["tokens"],
                 num_threads=self.config.num_threads,
-                provider=self.config.provider if self.config.use_gpu else "cpu",
+                provider=provider,
             )
-            return
-
-        raise ValueError(f"Could not detect model type in {model_path}")
+        
+        elif model_type == "paraformer":
+            self._recognizer = sherpa_onnx.OfflineRecognizer.from_paraformer(
+                model=config["model"],
+                tokens=config["tokens"],
+                num_threads=self.config.num_threads,
+                provider=provider,
+            )
+        
+        elif model_type == "ctc":
+            # Try NeMo CTC first, fall back to generic
+            try:
+                self._recognizer = sherpa_onnx.OfflineRecognizer.from_nemo_ctc(
+                    model=config["model"],
+                    tokens=config["tokens"],
+                    num_threads=self.config.num_threads,
+                    provider=provider,
+                )
+            except Exception:
+                _LOGGER.warning("NeMo CTC failed, trying generic CTC")
+                self._recognizer = sherpa_onnx.OfflineRecognizer.from_zipformer_ctc(
+                    model=config["model"],
+                    tokens=config["tokens"],
+                    num_threads=self.config.num_threads,
+                    provider=provider,
+                )
+        
+        else:
+            raise ValueError(f"Unknown model type: {model_type}")
+        
+        _LOGGER.info("ASR model loaded successfully")
 
     def recognize(
         self, audio: np.ndarray, sample_rate: int, language: Optional[str] = None
@@ -139,12 +306,72 @@ class SherpaASREngine:
 
 
 class SherpaTTSEngine:
-    """Sherpa-onnx TTS engine wrapper."""
+    """Sherpa-onnx TTS engine wrapper supporting multiple model types."""
 
     def __init__(self, config: TTSConfig) -> None:
         self.config = config
         self._tts = None
         self.sample_rate = TTS_SAMPLE_RATE
+
+    def _detect_model_type(self, model_path: Path) -> Tuple[str, dict]:
+        """
+        Detect TTS model type and return (type_name, config_dict).
+        
+        Supports:
+        - VITS/Piper: model.onnx + tokens.txt (+ optional espeak-ng-data, lexicon.txt, dict/)
+        - Matcha: model.onnx + tokens.txt (+ optional vocoder.onnx)
+        - Kokoro: model.onnx + tokens.txt + voices.bin (multi-speaker)
+        """
+        
+        # Find model file
+        model_onnx = _find_file(model_path, ["model.onnx", "model.int8.onnx"])
+        if not model_onnx:
+            # Try any .onnx file
+            onnx_files = list(model_path.glob("*.onnx"))
+            # Exclude vocoder files
+            onnx_files = [f for f in onnx_files if "vocoder" not in f.name.lower()]
+            if onnx_files:
+                model_onnx = onnx_files[0]
+        
+        if not model_onnx:
+            raise ValueError(f"No TTS ONNX model found in {model_path}")
+        
+        tokens = _find_tokens(model_path)
+        if not tokens:
+            raise ValueError(f"tokens.txt not found in {model_path}")
+        
+        path_lower = str(model_path).lower()
+        
+        # Detect Kokoro (has voices.bin)
+        voices_bin = model_path / "voices.bin"
+        if voices_bin.exists() or "kokoro" in path_lower:
+            return "kokoro", {
+                "model": str(model_onnx),
+                "tokens": str(tokens),
+                "voices": str(voices_bin) if voices_bin.exists() else "",
+            }
+        
+        # Detect Matcha (check for separate vocoder or matcha in path)
+        vocoder = _find_file(model_path, ["vocoder.onnx", "hifigan.onnx", "*vocoder*.onnx"])
+        if vocoder or "matcha" in path_lower:
+            return "matcha", {
+                "model": str(model_onnx),
+                "tokens": str(tokens),
+                "vocoder": str(vocoder) if vocoder else "",
+            }
+        
+        # Default: VITS/Piper (most common)
+        data_dir = model_path / "espeak-ng-data"
+        lexicon = model_path / "lexicon.txt"
+        dict_dir = model_path / "dict"
+        
+        return "vits", {
+            "model": str(model_onnx),
+            "tokens": str(tokens),
+            "data_dir": str(data_dir) if data_dir.exists() else "",
+            "lexicon": str(lexicon) if lexicon.exists() else "",
+            "dict_dir": str(dict_dir) if dict_dir.exists() else "",
+        }
 
     async def load(self) -> None:
         """Load the TTS model."""
@@ -152,48 +379,61 @@ class SherpaTTSEngine:
 
         _LOGGER.info("Loading TTS model from %s", self.config.model_path)
 
-        model_path = self.config.model_path
-
-        # Look for VITS model file
-        vits_model = model_path / "model.onnx"
-        if not vits_model.exists():
-            # Try alternate name
-            vits_model = model_path / "en_US-lessac-medium.onnx"
-
-        # Find any .onnx file
-        if not vits_model.exists():
-            onnx_files = list(model_path.glob("*.onnx"))
-            if onnx_files:
-                vits_model = onnx_files[0]
-            else:
-                raise ValueError(f"No ONNX model found in {model_path}")
-
-        # Look for tokens file
-        tokens_file = model_path / "tokens.txt"
-        if not tokens_file.exists():
-            raise ValueError(f"tokens.txt not found in {model_path}")
-
-        # Look for data directory (for Piper models)
-        data_dir = model_path / "espeak-ng-data"
-        lexicon = model_path / "lexicon.txt"
-        dict_dir = model_path / "dict"
-
-        tts_config = sherpa_onnx.OfflineTtsConfig(
-            model=sherpa_onnx.OfflineTtsModelConfig(
-                vits=sherpa_onnx.OfflineTtsVitsModelConfig(
-                    model=str(vits_model),
-                    tokens=str(tokens_file),
-                    data_dir=str(data_dir) if data_dir.exists() else "",
-                    lexicon=str(lexicon) if lexicon.exists() else "",
-                    dict_dir=str(dict_dir) if dict_dir.exists() else "",
+        model_type, config = self._detect_model_type(self.config.model_path)
+        provider = self.config.provider if self.config.use_gpu else "cpu"
+        
+        _LOGGER.info("Detected %s TTS model", model_type)
+        
+        if model_type == "vits":
+            tts_config = sherpa_onnx.OfflineTtsConfig(
+                model=sherpa_onnx.OfflineTtsModelConfig(
+                    vits=sherpa_onnx.OfflineTtsVitsModelConfig(
+                        model=config["model"],
+                        tokens=config["tokens"],
+                        data_dir=config["data_dir"],
+                        lexicon=config["lexicon"],
+                        dict_dir=config["dict_dir"],
+                    ),
+                    provider=provider,
+                    num_threads=self.config.num_threads,
                 ),
-                provider=self.config.provider if self.config.use_gpu else "cpu",
-                num_threads=self.config.num_threads,
-            ),
-            max_num_sentences=1,
-        )
-
-        self._tts = sherpa_onnx.OfflineTts(tts_config)
+                max_num_sentences=1,
+            )
+            self._tts = sherpa_onnx.OfflineTts(tts_config)
+        
+        elif model_type == "matcha":
+            tts_config = sherpa_onnx.OfflineTtsConfig(
+                model=sherpa_onnx.OfflineTtsModelConfig(
+                    matcha=sherpa_onnx.OfflineTtsMatchaModelConfig(
+                        acoustic_model=config["model"],
+                        vocoder=config["vocoder"],
+                        tokens=config["tokens"],
+                    ),
+                    provider=provider,
+                    num_threads=self.config.num_threads,
+                ),
+                max_num_sentences=1,
+            )
+            self._tts = sherpa_onnx.OfflineTts(tts_config)
+        
+        elif model_type == "kokoro":
+            tts_config = sherpa_onnx.OfflineTtsConfig(
+                model=sherpa_onnx.OfflineTtsModelConfig(
+                    kokoro=sherpa_onnx.OfflineTtsKokoroModelConfig(
+                        model=config["model"],
+                        tokens=config["tokens"],
+                        voices=config["voices"],
+                    ),
+                    provider=provider,
+                    num_threads=self.config.num_threads,
+                ),
+                max_num_sentences=1,
+            )
+            self._tts = sherpa_onnx.OfflineTts(tts_config)
+        
+        else:
+            raise ValueError(f"Unknown TTS model type: {model_type}")
+        
         self.sample_rate = self._tts.sample_rate
         _LOGGER.info("TTS loaded, sample rate: %d", self.sample_rate)
 
@@ -211,3 +451,4 @@ class SherpaTTSEngine:
         )
 
         return audio.samples
+
