@@ -51,9 +51,11 @@ RUN cp -r /build/sherpa-onnx/build/bin/* /usr/local/bin/ && \
     cp -r /build/sherpa-onnx/build/lib/* /usr/local/lib/ && \
     ldconfig
 
-# Install Python sherpa-onnx from source build
+# Install Python sherpa-onnx from source with GPU support
+# Must set SHERPA_ONNX_CMAKE_ARGS to enable GPU in the Python bindings
+ENV SHERPA_ONNX_CMAKE_ARGS="-DSHERPA_ONNX_ENABLE_GPU=ON -DSHERPA_ONNX_LINUX_ARM64_GPU_ONNXRUNTIME_VERSION=${SHERPA_ONNX_VERSION}"
 RUN cd /build/sherpa-onnx && \
-    pip3 install --no-cache-dir .
+    python3 setup.py install
 
 # Clean up build directory to reduce image size
 RUN rm -rf /build
