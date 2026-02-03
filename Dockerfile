@@ -33,7 +33,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 
 # Clone and build sherpa-onnx with GPU support for Jetson Orin NX
-RUN git clone https://github.com/k2-fsa/sherpa-onnx && \
+# Using specific release for reproducible builds
+RUN git clone --depth 1 --branch v1.12.23 https://github.com/k2-fsa/sherpa-onnx && \
     cd sherpa-onnx && \
     mkdir build && \
     cd build && \
