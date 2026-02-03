@@ -2,8 +2,8 @@
 # CUDA 12.6, cuDNN 9, Linux arm64 (JetPack 6.x / L4T 36.4.7)
 # Based on: https://k2-fsa.github.io/sherpa/onnx/install/linux.html
 
-# Use NVIDIA L4T base image for Jetson Orin (JetPack 6.x)
-FROM nvcr.io/nvidia/l4t-base:r36.4.0
+# Use NVIDIA L4T JetPack image for Jetson Orin (JetPack 6.x)
+FROM nvcr.io/nvidia/l4t-jetpack:r36.4.0
 
 LABEL maintainer="wyoming-sherpa-onnx"
 LABEL description="Wyoming sherpa-onnx ASR/TTS for Jetson Orin NX (JetPack 6.x)"
