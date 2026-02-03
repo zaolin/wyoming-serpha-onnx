@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wyoming-sherpa-onnx"
+version = "0.1.0"
+description = "Wyoming protocol server for sherpa-onnx ASR and TTS"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Wyoming Sherpa-ONNX Contributors"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+dependencies = [
+    "wyoming>=1.5.0",
+    "sherpa-onnx>=1.10.0",
+    "numpy>=1.24.0",
+    "soundfile>=0.12.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+wyoming-sherpa-onnx = "wyoming_sherpa_onnx.__main__:run"
+
+[project.urls]
+Homepage = "https://github.com/k2-fsa/sherpa-onnx"
+Documentation = "https://k2-fsa.github.io/sherpa/onnx/"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["wyoming_sherpa_onnx*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4"]
+ignore = ["E501"]
