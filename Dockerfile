@@ -70,7 +70,7 @@ RUN pip3 install --no-cache-dir \
     wyoming>=1.5.0 \
     numpy>=1.24.0 \
     soundfile>=0.12.0 \
-    && pip3 install --no-cache-dir -e /app
+    && pip3 install --no-cache-dir /app
 
 # Create directories for models
 RUN mkdir -p /app/models/asr /app/models/tts
