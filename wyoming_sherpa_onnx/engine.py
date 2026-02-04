@@ -219,20 +219,33 @@ class SherpaASREngine:
         model_type, config = self._detect_model_type(self.config.model_path)
         provider = self.config.provider if self.config.use_gpu else "cpu"
         
+        # Define which model types support streaming (online) mode
+        ONLINE_CAPABLE_TYPES = {"transducer", "paraformer", "online-transducer", "online-paraformer"}
+        OFFLINE_ONLY_TYPES = {"whisper", "sensevoice", "moonshine", "ctc"}
+        
         # Determine mode (Offline or Online)
         is_streaming = False
         
         if self.config.mode == "online":
-            is_streaming = True
-            _LOGGER.info("Forced ONLINE (streaming) mode via config")
+            # Check if model supports online mode
+            if model_type in OFFLINE_ONLY_TYPES:
+                _LOGGER.warning(
+                    "Model type '%s' does not support ONLINE (streaming) mode. "
+                    "Falling back to OFFLINE mode. Remove ASR_MODE or set ASR_MODE=offline.",
+                    model_type
+                )
+                is_streaming = False
+            else:
+                is_streaming = True
+                _LOGGER.info("Forced ONLINE (streaming) mode via config")
         elif self.config.mode == "offline":
             is_streaming = False
             _LOGGER.info("Forced OFFLINE mode via config")
         else:
             # Auto-detect
-            if model_type.startswith("online-") or "zipformer" in model_type:
+            if model_type.startswith("online-"):
                 is_streaming = True
-            elif "streaming" in str(self.config.model_path).lower():
+            elif model_type in ONLINE_CAPABLE_TYPES and "streaming" in str(self.config.model_path).lower():
                 is_streaming = True
             
             _LOGGER.info("Auto-detected mode: %s", "ONLINE" if is_streaming else "OFFLINE")
@@ -250,7 +263,7 @@ class SherpaASREngine:
                  
             self._model_type = model_type # Update internal type
             
-            if model_type == "online-transducer" or "zipformer" in model_type:
+            if model_type == "online-transducer":
                  # Zipformer uses transducer API
                 self._recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
                     encoder=config["encoder"],
@@ -268,16 +281,11 @@ class SherpaASREngine:
                     provider=provider,
                 )
             else:
-                 # Attempt fallback to transducer for unknown online types
-                 _LOGGER.warning("Unknown online type '%s', trying Transducer", model_type)
-                 self._recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
-                    encoder=config.get("encoder"),
-                    decoder=config.get("decoder"),
-                    joiner=config.get("joiner"),
-                    tokens=config.get("tokens"),
-                    num_threads=self.config.num_threads,
-                    provider=provider,
-                )
+                 # This shouldn't happen if validation above is correct
+                 raise ValueError(
+                     f"Model type '{model_type}' does not support ONLINE mode. "
+                     f"Set ASR_MODE=offline or use a streaming-capable model."
+                 )
 
         # --- Offline Models ---
         else:
