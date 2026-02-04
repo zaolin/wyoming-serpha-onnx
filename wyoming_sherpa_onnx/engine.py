@@ -253,17 +253,14 @@ class SherpaASREngine:
     def _detect_model_type(self, model_path: Path) -> Tuple[str, dict]:
         """
         Detect model type and return (type_name, config_dict).
-        
-        Supports:
-        - SenseVoice: model.onnx or model.int8.onnx
-        - Whisper: *-encoder.onnx + *-decoder.onnx or encoder.onnx + decoder.onnx
-        - Moonshine: preprocessor.onnx + encoder.onnx + uncached_decoder.onnx + cached_decoder.onnx
-        - Transducer: encoder.onnx + decoder.onnx + joiner.onnx
-        - Paraformer: model.onnx (with specific config)
-        - CTC (NeMo/WeNet/Zipformer): model.onnx
         """
+        path_lower = str(model_path).lower()
+        is_streaming = "streaming" in path_lower or "online" in path_lower or "zipformer" in path_lower
+
+        if is_streaming:
+            _LOGGER.info("Detected streaming (Online) model: %s", model_path.name)
         
-        # Check for Moonshine (has unique preprocessor.onnx)
+        # Check for Moonshine (Offline only)
         preprocessor = _find_file(model_path, ["preprocessor.onnx", "*preprocessor*.onnx"])
         if preprocessor:
             encoder = _find_file(model_path, ["encoder.onnx", "*-encoder.onnx"])
@@ -288,7 +285,7 @@ class SherpaASREngine:
             tokens = _find_tokens(model_path)
             
             if encoder and decoder and tokens:
-                return "transducer", {
+                return "online-transducer" if is_streaming else "transducer", {
                     "encoder": str(encoder),
                     "decoder": str(decoder),
                     "joiner": str(joiner),
@@ -296,7 +293,7 @@ class SherpaASREngine:
                 }
         
         # Check for Whisper (encoder + decoder, no joiner)
-        # Try various naming patterns
+        # ... (Whisper logic same as before, usually offline)
         encoder = _find_file(model_path, [
             "encoder.onnx", "encoder.int8.onnx",
             "*-encoder.onnx", "*-encoder.int8.onnx",
@@ -311,46 +308,40 @@ class SherpaASREngine:
             if not decoder.exists():
                 decoder = _find_file(model_path, ["decoder.onnx", "*-decoder.onnx", "*-decoder.int8.onnx"])
             
-            if decoder and decoder.exists():
-                # Check it's not a transducer (no joiner)
-                if not joiner:
-                    base_name = encoder.stem.replace("-encoder", "").replace(".int8", "")
-                    tokens = _find_tokens(model_path, base_name)
-                    
-                    if tokens:
-                        return "whisper", {
-                            "encoder": str(encoder),
-                            "decoder": str(decoder),
-                            "tokens": str(tokens),
-                        }
+            if decoder and decoder.exists() and not joiner:
+                base_name = encoder.stem.replace("-encoder", "").replace(".int8", "")
+                tokens = _find_tokens(model_path, base_name)
+                
+                if tokens:
+                    return "whisper", {
+                        "encoder": str(encoder),
+                        "decoder": str(decoder),
+                        "tokens": str(tokens),
+                    }
         
-        # Check for SenseVoice (model.onnx with sense/voice in path name)
+        # Check for Paraformer (Online or Offline)
         model_onnx = _find_file(model_path, ["model.onnx", "model.int8.onnx"])
         tokens = _find_tokens(model_path)
         
         if model_onnx and tokens:
-            # Determine type by directory name or file patterns
-            path_lower = str(model_path).lower()
-            
-            if "sense" in path_lower or "funaudio" in path_lower:
-                return "sensevoice", {
-                    "model": str(model_onnx),
-                    "tokens": str(tokens),
-                }
-            
             if "paraformer" in path_lower:
-                return "paraformer", {
+                return "online-paraformer" if is_streaming else "paraformer", {
                     "model": str(model_onnx),
                     "tokens": str(tokens),
                 }
             
+            if "zipformer" in path_lower:
+                 # Zipformer is typically online transducer but checked earlier via joiner.
+                 # If it ended up here, might be CTC or different structure.
+                 pass
+
             if "nemo" in path_lower or "ctc" in path_lower or "wenet" in path_lower:
                 return "ctc", {
                     "model": str(model_onnx),
                     "tokens": str(tokens),
                 }
             
-            # Default: try SenseVoice first (most common single-model format)
+            # Default: SenseVoice (Offline) or Generic
             return "sensevoice", {
                 "model": str(model_onnx),
                 "tokens": str(tokens),
@@ -374,8 +365,33 @@ class SherpaASREngine:
         provider = self.config.provider if self.config.use_gpu else "cpu"
         
         _LOGGER.info("Detected %s model", model_type)
+        self._model_type = model_type
         
-        if model_type == "sensevoice":
+        # --- Online (Streaming) Models ---
+        if model_type.startswith("online-") or "zipformer" in model_type:
+            if model_type == "online-transducer":
+                self._recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
+                    encoder=config["encoder"],
+                    decoder=config["decoder"],
+                    joiner=config["joiner"],
+                    tokens=config["tokens"],
+                    num_threads=self.config.num_threads,
+                    provider=provider,
+                )
+            elif model_type == "online-paraformer":
+                self._recognizer = sherpa_onnx.OnlineRecognizer.from_paraformer(
+                    model=config["model"],
+                    tokens=config["tokens"],
+                    num_threads=self.config.num_threads,
+                    provider=provider,
+                )
+            else:
+                # Fallback for other online types (like Zipformer2) typically use transducer
+                # If detected as 'online-transducer' above, it's covered.
+                 raise ValueError(f"Unsupported online model type: {model_type}")
+                 
+        # --- Offline Models ---
+        elif model_type == "sensevoice":
             self._recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
                 model=config["model"],
                 tokens=config["tokens"],
@@ -450,9 +466,8 @@ class SherpaASREngine:
         else:
             raise ValueError(f"Unknown model type: {model_type}")
         
-        self._model_type = model_type
         self._model_name = _detect_model_name(self.config.model_path)
-        _LOGGER.info("ASR model loaded: %s (%s)", self._model_name, model_type)
+        _LOGGER.info("ASR model loaded: %s (%s), provider: %s", self._model_name, model_type, self.config.provider)
 
     def recognize(
         self, audio: np.ndarray, sample_rate: int, language: Optional[str] = None
@@ -479,12 +494,32 @@ class SherpaASREngine:
             else:
                 audio = audio.astype(np.float32)
 
-        # Create stream and decode
+        # Route to appropriate handler
+        if str(self._model_type).startswith("online-"):
+            return self._recognize_online(audio, sample_rate)
+        else:
+            return self._recognize_offline(audio, sample_rate)
+
+    def _recognize_offline(self, audio: np.ndarray, sample_rate: int) -> str:
+        """Handle offline recognition."""
         stream = self._recognizer.create_stream()
         stream.accept_waveform(sample_rate, audio)
         self._recognizer.decode_stream(stream)
-
         return stream.result.text.strip()
+
+    def _recognize_online(self, audio: np.ndarray, sample_rate: int) -> str:
+        """Handle online (streaming) recognition in batch mode."""
+        stream = self._recognizer.create_stream()
+        
+        # For OnlineRecognizer, we accept waveform and then input_finished
+        stream.accept_waveform(sample_rate, audio)
+        stream.input_finished()
+        
+        # Decode untill finished
+        while self._recognizer.is_ready(stream):
+            self._recognizer.decode_stream(stream)
+        
+        return self._recognizer.get_result(stream).text.strip()
 
 
 class SherpaTTSEngine:
