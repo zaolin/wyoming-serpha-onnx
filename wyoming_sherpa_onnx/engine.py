@@ -888,8 +888,50 @@ class SherpaTTSEngine:
                     silence_samples = int(self.sample_rate * silence_duration)
                     all_samples.append(np.zeros(silence_samples, dtype=np.float32))
             except Exception as e:
-                # Log but continue with other chunks if one fails
-                _LOGGER.error("Failed to synthesize chunk '%s': %s", sentence[:50], e)
+                _LOGGER.warning("Failed to synthesize chunk '%s': %s. Retrying with fallback...", sentence[:50], e)
+                
+                # Fallback 1: Strip punctuation and retry
+                # Sometimes models choke on specific punctuation symbols at end of sentences
+                try:
+                    import re
+                    clean_sentence = re.sub(r'[^\w\s]', '', sentence).strip()
+                    if clean_sentence and clean_sentence != sentence.strip():
+                        _LOGGER.info("Retrying with cleaned text: '%s'", clean_sentence[:50])
+                        audio = self._tts.generate(
+                            clean_sentence,
+                            sid=sid,
+                            speed=self.config.speed,
+                        )
+                        if len(audio.samples) > 0:
+                            all_samples.append(audio.samples)
+                            silence_samples = int(self.sample_rate * 0.1)
+                            all_samples.append(np.zeros(silence_samples, dtype=np.float32))
+                            continue # Success
+                except Exception:
+                    pass
+
+                # Fallback 2: Word-by-word synthesis
+                # If the chunk is still toxic, break it down to atoms
+                _LOGGER.info("Retrying with word-by-word synthesis...")
+                words = sentence.split()
+                success_any = False
+                for word in words:
+                    try:
+                        audio = self._tts.generate(
+                            word,
+                            sid=sid,
+                            speed=self.config.speed,
+                        )
+                        if len(audio.samples) > 0:
+                            all_samples.append(audio.samples)
+                            # Tiny silence between words
+                            all_samples.append(np.zeros(int(self.sample_rate * 0.05), dtype=np.float32))
+                            success_any = True
+                    except Exception:
+                        pass # Skip bad words
+                
+                if not success_any:
+                     _LOGGER.error("All fallback attempts failed for chunk: '%s'", sentence[:50])
 
         if not all_samples:
              return np.array([], dtype=np.float32)
