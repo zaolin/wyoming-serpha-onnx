@@ -113,17 +113,102 @@ def check_gpu_memory_for_models(
     return True, f"GPU memory OK: {free} MB free, ~{required} MB required"
 
 
-    @dataclass
-    class ASRConfig:
-        """Configuration for ASR engine."""
-        model_path: Path
-        use_gpu: bool = True
-        num_threads: int = 4
-        provider: str = "cuda"  # cuda, cpu
-        language: str = ""  # Language code for Whisper (empty = auto-detect)
-        mode: str = "auto"  # auto, offline, online
+@dataclass
+class ASRConfig:
+    """Configuration for ASR engine."""
+    model_path: Path
+    use_gpu: bool = True
+    num_threads: int = 4
+    provider: str = "cuda"  # cuda, cpu
+    language: str = ""  # Language code for Whisper (empty = auto-detect)
+    mode: str = "auto"  # auto, offline, online
 
-    # ... (skipping _detect_model_type implementation details unless changed)
+
+class SherpaASREngine:
+    """ASR engine using sherpa-onnx."""
+
+    def __init__(self, config: ASRConfig) -> None:
+        self.config = config
+        self._recognizer = None
+        self._model_type = None
+        self._model_name = ""
+
+    def _detect_model_type(self, model_path: Path) -> tuple[str, dict]:
+        """
+        Detect model type and return type string + config dict.
+        
+        Supported types:
+        - whisper
+        - sensevoice
+        - moonshine
+        - transducer (zipformer/conformer)
+        - paraformer
+        - ctc (nemo/zipformer)
+        """
+        tokens = _find_file(model_path, ["tokens.txt", "*.txt"])
+        
+        # 1. SenseVoice (multilingual)
+        if _find_file(model_path, ["*sense-voice*", "*sensevoice*"]) or \
+           _find_file(model_path, ["model.onnx"]) and "sense" in str(model_path).lower():
+             model = _find_file(model_path, ["model.onnx", "*.onnx"]) # Usually just model.onnx
+             if model:
+                 return "sensevoice", {
+                     "model": str(model),
+                     "tokens": str(tokens) if tokens else None
+                 }
+
+        # 2. Whisper (multilingual)
+        encoder = _find_file(model_path, ["*encoder.onnx", "*encoder*.onnx"])
+        decoder = _find_file(model_path, ["*decoder.onnx", "*decoder*.onnx"])
+        if encoder and decoder:
+            return "whisper", {
+                "encoder": str(encoder),
+                "decoder": str(decoder),
+                "tokens": str(tokens) if tokens else None
+            }
+
+        # 3. Transducer (Zipformer/Conformer) - Streaming or Offline
+        # Look for joiner which is unique to transducer
+        joiner = _find_file(model_path, ["*joiner.onnx", "*joiner*.onnx"])
+        if joiner:
+            encoder = _find_file(model_path, ["*encoder.onnx", "*encoder*.onnx"])
+            decoder = _find_file(model_path, ["*decoder.onnx", "*decoder*.onnx"])
+            return "transducer", {
+                "encoder": str(encoder),
+                "decoder": str(decoder),
+                "joiner": str(joiner),
+                "tokens": str(tokens) if tokens else None
+            }
+            
+        # 4. Paraformer (Chinese)
+        paraformer = _find_file(model_path, ["*paraformer*.onnx", "model.onnx"])
+        if paraformer:
+             return "paraformer", {
+                 "model": str(paraformer),
+                 "tokens": str(tokens) if tokens else None
+             }
+
+        # 5. Moonshine
+        preprocessor = _find_file(model_path, ["preprocess.onnx", "*preprocess*.onnx"])
+        if preprocessor:
+             encoder = _find_file(model_path, ["*encoder.onnx"])
+             uncached = _find_file(model_path, ["*uncached_decoder.onnx"])
+             cached = _find_file(model_path, ["*cached_decoder.onnx"])
+             if encoder and uncached and cached:
+                 return "moonshine", {
+                     "preprocessor": str(preprocessor),
+                     "encoder": str(encoder),
+                     "uncached_decoder": str(uncached),
+                     "cached_decoder": str(cached),
+                     "tokens": str(tokens) if tokens else None
+                 }
+
+        # Default fallback (CTC likely)
+        model = _find_file(model_path, ["*.onnx"])
+        return "ctc", {
+             "model": str(model) if model else None,
+             "tokens": str(tokens) if tokens else None
+        } 
 
     async def load(self) -> None:
         """Load the ASR model."""
