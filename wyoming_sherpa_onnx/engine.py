@@ -639,6 +639,78 @@ class SherpaTTSEngine:
         self.sample_rate = self._tts.sample_rate
         _LOGGER.info("TTS loaded: %s (%s), sample rate: %d", self._model_name, model_type, self.sample_rate)
 
+    def _smart_split(self, text: str, max_len: int = 500) -> list[str]:
+        """Recursively split text into chunks smaller than max_len."""
+        if len(text) <= max_len:
+            return [text]
+        
+        # Try splitting by sentence endings
+        import re
+        parts = re.split(r'([.?!;]+\s+)', text)
+        chunks = []
+        current = ""
+        
+        for part in parts:
+            if len(current) + len(part) <= max_len:
+                current += part
+            else:
+                if current:
+                    chunks.append(current)
+                current = part
+        if current:
+            chunks.append(current)
+            
+        # If splitting by proper sentences didn't help (still have big chunks)
+        # Try splitting by clauses (commas, colons)
+        final_chunks = []
+        for chunk in chunks:
+            if len(chunk) <= max_len:
+                final_chunks.append(chunk)
+                continue
+                
+            # Split by comma/colon
+            sub_parts = re.split(r'([,:—]+\s+)', chunk)
+            sub_current = ""
+            for part in sub_parts:
+                if len(sub_current) + len(part) <= max_len:
+                    sub_current += part
+                else:
+                    if sub_current:
+                         # If even sub-chunk is too big, split by space
+                        if len(sub_current) > max_len:
+                            words = sub_current.split(' ')
+                            w_current = ""
+                            for word in words:
+                                if len(w_current) + len(word) + 1 <= max_len:
+                                    w_current += (word + " ")
+                                else:
+                                    if w_current:
+                                        final_chunks.append(w_current.strip())
+                                    w_current = word + " "
+                            if w_current:
+                                final_chunks.append(w_current.strip())
+                        else:
+                            final_chunks.append(sub_current)
+                    sub_current = part
+            if sub_current:
+                 # Check last piece
+                if len(sub_current) > max_len:
+                    words = sub_current.split(' ')
+                    w_current = ""
+                    for word in words:
+                        if len(w_current) + len(word) + 1 <= max_len:
+                            w_current += (word + " ")
+                        else:
+                            if w_current:
+                                final_chunks.append(w_current.strip())
+                            w_current = word + " "
+                    if w_current:
+                        final_chunks.append(w_current.strip())
+                else:
+                    final_chunks.append(sub_current)
+                    
+        return [c for c in final_chunks if c.strip()]
+
     def synthesize(self, text: str, speaker_id: Optional[int] = None) -> np.ndarray:
         """Synthesize speech from text."""
         if self._tts is None:
@@ -646,51 +718,37 @@ class SherpaTTSEngine:
 
         sid = speaker_id if speaker_id is not None else self.config.speaker_id
 
-        # Split text into chunks to avoid model input limits
-        # VITS models often crash with very long inputs
-        import re
+        # Smart split text into chunks < 500 chars to avoid model crashes
+        # VITS models have hard input limits
+        sentences = self._smart_split(text, max_len=500)
         
-        # Split by sentence endings, keeping the punctuation
-        # This regex matches: (. or ? or ! or ;) followed by whitespace or end of string
-        chunks = re.split(r'([.?!;]+\s+)', text)
-        
-        # Recombine split parts (sentences + separators)
-        sentences = []
-        current_sentence = ""
-        for part in chunks:
-            current_sentence += part
-            # If part ends with punctuation/space or is the last part, verify and add
-            if re.search(r'[.?!;]+\s*$', part) or part == chunks[-1]:
-                if current_sentence.strip():
-                     sentences.append(current_sentence)
-                current_sentence = ""
-        
-        # If regex split failed to produce anything valid, fallback to original
+        # If somehow we still have no sentences
         if not sentences and text.strip():
             sentences = [text]
 
-        # Synthesize each sentence
+        # Synthesize each chunk
         all_samples = []
         for sentence in sentences:
             if not sentence.strip():
                 continue
                 
-            # If sentence is still unreasonably long, just try it (or we could split by comma)
-            # But usually sentence splitting is enough
-            
-            audio = self._tts.generate(
-                sentence,
-                sid=sid,
-                speed=self.config.speed,
-            )
-            if len(audio.samples) > 0:
-                all_samples.append(audio.samples)
-                
-                # Add a small silence between sentences (e.g., 200ms)
-                # 22050 Hz * 0.2s = 4410 samples
-                silence_duration = 0.2
-                silence_samples = int(self.sample_rate * silence_duration)
-                all_samples.append(np.zeros(silence_samples, dtype=np.float32))
+            try:
+                audio = self._tts.generate(
+                    sentence,
+                    sid=sid,
+                    speed=self.config.speed,
+                )
+                if len(audio.samples) > 0:
+                    all_samples.append(audio.samples)
+                    
+                    # Add a small silence between chunks (e.g., 100ms)
+                    # Reduced from 200ms to keep flow natural across comma splits
+                    silence_duration = 0.1
+                    silence_samples = int(self.sample_rate * silence_duration)
+                    all_samples.append(np.zeros(silence_samples, dtype=np.float32))
+            except Exception as e:
+                # Log but continue with other chunks if one fails
+                _LOGGER.error("Failed to synthesize chunk '%s': %s", sentence[:50], e)
 
         if not all_samples:
              return np.array([], dtype=np.float32)
