@@ -59,15 +59,39 @@ def parse_args() -> argparse.Namespace:
         "--tts-model",
         type=Path,
         default=Path(os.environ.get("TTS_MODEL_PATH", "/app/models/tts")),
-        help="Path to TTS model directory",
-    )
-    # Optional language overrides (comma-separated, e.g., "de,en" or "de")
     parser.add_argument(
-        "--asr-languages",
-        type=str,
-        default=os.environ.get("ASR_LANGUAGES", ""),
-        help="Override ASR languages (comma-separated, e.g., 'de,en')",
+        "--asr-mode",
+        choices=["auto", "offline", "online"],
+        default=os.environ.get("ASR_MODE", "auto"),
+        help="ASR mode (auto, offline, online). Detects automatically by default.",
     )
+
+    # ... (args parsing done) ...
+
+    # Initialize ASR
+    asr_engine: Optional[SherpaASREngine] = None
+    if not args.tts_only and args.asr_model.exists():
+        # Use first configured language for engine if specified
+        engine_lang = ""
+        if args.asr_languages:
+            engine_lang = args.asr_languages.split(",")[0].strip()
+
+        asr_config = ASRConfig(
+            model_path=args.asr_model,
+            use_gpu=asr_use_gpu,
+            provider="cuda" if asr_use_gpu else "cpu",
+            language=engine_lang,
+            mode=args.asr_mode,
+        )
+        asr_engine = SherpaASREngine(asr_config)
+        await asr_engine.load()
+        _LOGGER.info("ASR engine loaded (%s)", "GPU" if asr_use_gpu else "CPU")
+
+        tasks.append(
+            asyncio.create_task(
+                run_asr_server(args.asr_uri, asr_engine, asr_lock, args.asr_languages)
+            )
+        )
     parser.add_argument(
         "--tts-languages",
         type=str,

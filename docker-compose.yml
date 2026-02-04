@@ -23,6 +23,9 @@ services:
       # Server URIs
       - ASR_URI=tcp://0.0.0.0:10300
       - TTS_URI=tcp://0.0.0.0:10400
+      # Operation Mode (auto | offline | online)
+      # Force 'online' if using a streaming model that isn't auto-detected
+      # - ASR_MODE=auto
     ports:
       # ASR (speech-to-text)
       - "10300:10300"

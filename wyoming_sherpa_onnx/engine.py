@@ -113,15 +113,214 @@ def check_gpu_memory_for_models(
     return True, f"GPU memory OK: {free} MB free, ~{required} MB required"
 
 
-@dataclass
-class ASRConfig:
-    """Configuration for ASR engine."""
+    @dataclass
+    class ASRConfig:
+        """Configuration for ASR engine."""
+        model_path: Path
+        use_gpu: bool = True
+        num_threads: int = 4
+        provider: str = "cuda"  # cuda, cpu
+        language: str = ""  # Language code for Whisper (empty = auto-detect)
+        mode: str = "auto"  # auto, offline, online
 
-    model_path: Path
-    use_gpu: bool = True
-    num_threads: int = 4
-    provider: str = "cuda"  # cuda, cpu
-    language: str = ""  # Language code for Whisper (empty = auto-detect)
+    # ... (skipping _detect_model_type implementation details unless changed)
+
+    async def load(self) -> None:
+        """Load the ASR model."""
+        import sherpa_onnx
+
+        _LOGGER.info("Loading ASR model from %s", self.config.model_path)
+
+        model_type, config = self._detect_model_type(self.config.model_path)
+        provider = self.config.provider if self.config.use_gpu else "cpu"
+        
+        # Determine mode (Offline or Online)
+        is_streaming = False
+        
+        if self.config.mode == "online":
+            is_streaming = True
+            _LOGGER.info("Forced ONLINE (streaming) mode via config")
+        elif self.config.mode == "offline":
+            is_streaming = False
+            _LOGGER.info("Forced OFFLINE mode via config")
+        else:
+            # Auto-detect
+            if model_type.startswith("online-") or "zipformer" in model_type:
+                is_streaming = True
+            elif "streaming" in str(self.config.model_path).lower():
+                is_streaming = True
+            
+            _LOGGER.info("Auto-detected mode: %s", "ONLINE" if is_streaming else "OFFLINE")
+
+        _LOGGER.info("Detected %s model", model_type)
+        self._model_type = model_type
+        
+        # --- Online (Streaming) Models ---
+        if is_streaming:
+            # Force model type to online variant if generic 'transducer' or 'paraformer' was returned
+            if model_type == "transducer":
+                 model_type = "online-transducer"
+            elif model_type == "paraformer":
+                 model_type = "online-paraformer"
+                 
+            self._model_type = model_type # Update internal type
+            
+            if model_type == "online-transducer" or "zipformer" in model_type:
+                 # Zipformer uses transducer API
+                self._recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
+                    encoder=config["encoder"],
+                    decoder=config["decoder"],
+                    joiner=config["joiner"],
+                    tokens=config["tokens"],
+                    num_threads=self.config.num_threads,
+                    provider=provider,
+                )
+            elif model_type == "online-paraformer":
+                self._recognizer = sherpa_onnx.OnlineRecognizer.from_paraformer(
+                    model=config["model"],
+                    tokens=config["tokens"],
+                    num_threads=self.config.num_threads,
+                    provider=provider,
+                )
+            else:
+                 # Attempt fallback to transducer for unknown online types
+                 _LOGGER.warning("Unknown online type '%s', trying Transducer", model_type)
+                 self._recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
+                    encoder=config.get("encoder"),
+                    decoder=config.get("decoder"),
+                    joiner=config.get("joiner"),
+                    tokens=config.get("tokens"),
+                    num_threads=self.config.num_threads,
+                    provider=provider,
+                )
+
+        # --- Offline Models ---
+        else:
+            if model_type == "sensevoice":
+                self._recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+                    model=config["model"],
+                    tokens=config["tokens"],
+                    use_itn=True,
+                    num_threads=self.config.num_threads,
+                    provider=provider,
+                )
+            elif model_type == "whisper":
+                whisper_lang = self.config.language or ""
+                _LOGGER.info("Whisper language: %s", whisper_lang if whisper_lang else "auto-detect")
+                self._recognizer = sherpa_onnx.OfflineRecognizer.from_whisper(
+                    encoder=config["encoder"],
+                    decoder=config["decoder"],
+                    tokens=config["tokens"],
+                    language=whisper_lang,
+                    task="transcribe",
+                    num_threads=self.config.num_threads,
+                    provider=provider,
+                )
+            elif model_type == "moonshine":
+                self._recognizer = sherpa_onnx.OfflineRecognizer.from_moonshine(
+                    preprocessor=config["preprocessor"],
+                    encoder=config["encoder"],
+                    uncached_decoder=config["uncached_decoder"],
+                    cached_decoder=config["cached_decoder"],
+                    tokens=config["tokens"],
+                    num_threads=self.config.num_threads,
+                    provider=provider,
+                )
+            elif model_type == "transducer":
+                self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
+                    encoder=config["encoder"],
+                    decoder=config["decoder"],
+                    joiner=config["joiner"],
+                    tokens=config["tokens"],
+                    num_threads=self.config.num_threads,
+                    provider=provider,
+                )
+            elif model_type == "paraformer":
+                self._recognizer = sherpa_onnx.OfflineRecognizer.from_paraformer(
+                    model=config["model"],
+                    tokens=config["tokens"],
+                    num_threads=self.config.num_threads,
+                    provider=provider,
+                )
+            elif model_type == "ctc":
+                 try:
+                    self._recognizer = sherpa_onnx.OfflineRecognizer.from_nemo_ctc(
+                        model=config["model"],
+                        tokens=config["tokens"],
+                        num_threads=self.config.num_threads,
+                        provider=provider,
+                    )
+                 except Exception:
+                    self._recognizer = sherpa_onnx.OfflineRecognizer.from_zipformer_ctc(
+                        model=config["model"],
+                        tokens=config["tokens"],
+                        num_threads=self.config.num_threads,
+                        provider=provider,
+                    )
+            else:
+                raise ValueError(f"Unknown offline model type: {model_type}")
+
+        self._model_name = _detect_model_name(self.config.model_path)
+        _LOGGER.info("ASR model loaded: %s (%s - %s), provider: %s", 
+                     self._model_name, 
+                     model_type, 
+                     "ONLINE" if is_streaming else "OFFLINE",
+                     self.config.provider)
+
+    def recognize(
+        self, audio: np.ndarray, sample_rate: int, language: Optional[str] = None
+    ) -> str:
+        """Recognize speech from audio samples."""
+        if self._recognizer is None:
+            raise RuntimeError("ASR engine not loaded")
+
+        # Resample logic (same as before)
+        if sample_rate != ASR_SAMPLE_RATE:
+            duration = len(audio) / sample_rate
+            new_length = int(duration * ASR_SAMPLE_RATE)
+            old_indices = np.linspace(0, len(audio) - 1, len(audio))
+            new_indices = np.linspace(0, len(audio) - 1, new_length)
+            audio = np.interp(new_indices, old_indices, audio).astype(np.float32)
+            sample_rate = ASR_SAMPLE_RATE
+
+        if audio.dtype != np.float32:
+             if audio.dtype == np.int16:
+                audio = audio.astype(np.float32) / 32768.0
+             else:
+                audio = audio.astype(np.float32)
+
+        try:
+            # Route to appropriate handler
+            if str(self._model_type).startswith("online-"):
+                return self._recognize_online(audio, sample_rate)
+            else:
+                return self._recognize_offline(audio, sample_rate)
+        except RuntimeError as e:
+            msg = str(e)
+            if "invalid dimensions" in msg or "Mismatch" in msg:
+                _LOGGER.error(
+                    "ASR Runtime Error: %s. \n"
+                    "This usually means a Streaming (Online) model is being run as Offline, or vice-versa.\n"
+                    "Try setting ASR_MODE=online (or offline) in docker-compose.yml to match your model type.",
+                    msg
+                )
+            raise
+
+    def _recognize_offline(self, audio: np.ndarray, sample_rate: int) -> str:
+        stream = self._recognizer.create_stream()
+        stream.accept_waveform(sample_rate, audio)
+        self._recognizer.decode_stream(stream)
+        text = stream.result.text.strip()
+        return text
+
+    def _recognize_online(self, audio: np.ndarray, sample_rate: int) -> str:
+        stream = self._recognizer.create_stream()
+        stream.accept_waveform(sample_rate, audio)
+        stream.input_finished()
+        while self._recognizer.is_ready(stream):
+            self._recognizer.decode_stream(stream)
+        text = self._recognizer.get_result(stream).text.strip()
+        return text
 
 
 @dataclass
