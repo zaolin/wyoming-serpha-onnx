@@ -556,24 +556,45 @@ async def main() -> None:
     # Initialize TTS
     tts_engine: Optional[SherpaTTSEngine] = None
     if not args.asr_only and args.tts_model.exists():
-        try:
-            tts_config = TTSConfig(
-                model_path=args.tts_model,
-                use_gpu=tts_use_gpu,
-                provider="cuda" if tts_use_gpu else "cpu",
-                speaker_id=args.speaker_id,
-            )
-            tts_engine = SherpaTTSEngine(tts_config)
-            await tts_engine.load()
-            _LOGGER.info("TTS engine loaded")
+        # Helper to load TTS engine with fallback
+        async def load_tts(config: TTSConfig) -> Optional[SherpaTTSEngine]:
+            try:
+                engine = SherpaTTSEngine(config)
+                await engine.load()
+                return engine
+            except Exception:
+                if config.use_gpu:
+                    _LOGGER.warning("Failed to load TTS model on GPU, retrying with CPU...")
+                    try:
+                        config.use_gpu = False
+                        config.provider = "cpu"
+                        engine = SherpaTTSEngine(config)
+                        await engine.load()
+                        _LOGGER.info("Fallback to CPU successful")
+                        return engine
+                    except Exception:
+                         _LOGGER.exception("Failed to load TTS model (CPU fallback also failed)")
+                         return None
+                else:
+                    _LOGGER.exception("Failed to load TTS model")
+                    return None
 
+        tts_config = TTSConfig(
+            model_path=args.tts_model,
+            use_gpu=tts_use_gpu,
+            provider="cuda" if tts_use_gpu else "cpu",
+            speaker_id=args.speaker_id,
+        )
+        
+        tts_engine = await load_tts(tts_config)
+        
+        if tts_engine:
+            _LOGGER.info("TTS engine loaded")
             tasks.append(
                 asyncio.create_task(
                     run_tts_server(args.tts_uri, tts_engine, tts_lock, args.speaker_id, args.tts_languages)
                 )
             )
-        except Exception:
-            _LOGGER.exception("Failed to load TTS model")
     elif not args.asr_only:
         _LOGGER.warning("TTS model not found at %s", args.tts_model)
 
