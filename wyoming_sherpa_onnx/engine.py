@@ -175,13 +175,18 @@ class SherpaASREngine:
             encoder = _find_file(model_path, ["*encoder.onnx", "*encoder*.onnx"])
             decoder = _find_file(model_path, ["*decoder.onnx", "*decoder*.onnx"])
             if encoder and decoder:
-                # Check for NeMo specific handling
+                # Check for NeMo specific handling - same as Transducer but detected for logging
                 if "nemo" in search_target or "nemo" in encoder.name.lower():
+                     # NeMo might use tokenizer.model or vocab.txt instead of tokens.txt
+                     nemo_tokens = tokens
+                     if not nemo_tokens:
+                        nemo_tokens = _find_file(model_path, ["tokenizer.model", "vocab.txt"])
+                        
                      return "nemo-transducer", {
                         "encoder": str(encoder),
                         "decoder": str(decoder),
                         "joiner": str(joiner),
-                        "tokens": str(tokens) if tokens else None
+                        "tokens": str(nemo_tokens) if nemo_tokens else None
                     }
                 
                 return "transducer", {
@@ -377,7 +382,8 @@ class SherpaASREngine:
                     provider=provider,
                 )
             elif model_type == "nemo-transducer":
-                 self._recognizer = sherpa_onnx.OfflineRecognizer.from_nemo_transducer(
+                 # Use standard transducer loader but with (potentially) NeMo-specific tokens found above
+                 self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
                     encoder=config["encoder"],
                     decoder=config["decoder"],
                     joiner=config["joiner"],
