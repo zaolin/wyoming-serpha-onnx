@@ -213,7 +213,34 @@ class SherpaASREngine:
                      "tokens": str(tokens) if tokens else None
                  }
 
-        # Default fallback (CTC likely)
+        # 6. NeMo CTC (single model.onnx but with 'nemo' in name/path)
+        if "nemo" in str(model_path).lower():
+            model = _find_file(model_path, ["model.onnx", "*.onnx"])
+            if model:
+                return "nemo-ctc", {
+                    "model": str(model),
+                    "tokens": str(tokens) if tokens else None
+                }
+
+        # 7. FireRedAsr (specific name pattern usually)
+        if "fire-red" in str(model_path).lower() or "firered" in str(model_path).lower():
+             model = _find_file(model_path, ["model.onnx", "*.onnx"])
+             if model:
+                 return "fire-red-asr", {
+                     "model": str(model),
+                     "tokens": str(tokens) if tokens else None
+                 }
+
+        # 8. Wenet CTC
+        if "wenet" in str(model_path).lower():
+             model = _find_file(model_path, ["final.onnx", "model.onnx", "*.onnx"])
+             if model:
+                 return "wenet-ctc", {
+                     "model": str(model),
+                     "tokens": str(tokens) if tokens else None
+                 }
+
+        # Default fallback (Generic CTC / Zipformer CTC)
         model = _find_file(model_path, ["*.onnx"])
         return "ctc", {
              "model": str(model) if model else None,
@@ -354,21 +381,35 @@ class SherpaASREngine:
                     num_threads=self.config.num_threads,
                     provider=provider,
                 )
+            elif model_type == "nemo-ctc":
+                 self._recognizer = sherpa_onnx.OfflineRecognizer.from_nemo_ctc(
+                    model=config["model"],
+                    tokens=config["tokens"],
+                    num_threads=self.config.num_threads,
+                    provider=provider,
+                )
+            elif model_type == "fire-red-asr":
+                 self._recognizer = sherpa_onnx.OfflineRecognizer.from_fire_red_asr(
+                    model=config["model"],
+                    tokens=config["tokens"],
+                    num_threads=self.config.num_threads,
+                    provider=provider,
+                )
+            elif model_type == "wenet-ctc":
+                 self._recognizer = sherpa_onnx.OfflineRecognizer.from_wenet_ctc(
+                    model=config["model"],
+                    tokens=config["tokens"],
+                    num_threads=self.config.num_threads,
+                    provider=provider,
+                )
             elif model_type == "ctc":
-                 try:
-                    self._recognizer = sherpa_onnx.OfflineRecognizer.from_nemo_ctc(
-                        model=config["model"],
-                        tokens=config["tokens"],
-                        num_threads=self.config.num_threads,
-                        provider=provider,
-                    )
-                 except Exception:
-                    self._recognizer = sherpa_onnx.OfflineRecognizer.from_zipformer_ctc(
-                        model=config["model"],
-                        tokens=config["tokens"],
-                        num_threads=self.config.num_threads,
-                        provider=provider,
-                    )
+                 # Fallback generic CTC (Zipformer CTC usually)
+                 self._recognizer = sherpa_onnx.OfflineRecognizer.from_zipformer_ctc(
+                    model=config["model"],
+                    tokens=config["tokens"],
+                    num_threads=self.config.num_threads,
+                    provider=provider,
+                )
             else:
                 raise ValueError(f"Unknown offline model type: {model_type}")
 
