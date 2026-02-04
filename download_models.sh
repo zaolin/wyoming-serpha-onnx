@@ -1,23 +1,29 @@
 #!/bin/bash
 # Download models for Wyoming sherpa-onnx
-# Usage: ./download_models.sh [asr|tts|all] [model_name]
+# 
+# Models are downloaded from GitHub releases:
+#   ASR: https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models
+#   TTS: https://github.com/k2-fsa/sherpa-onnx/releases/tag/tts-models
 #
-# Examples:
-#   ./download_models.sh all                    # Download default ASR + TTS
-#   ./download_models.sh asr whisper-large-v3   # Download Whisper large-v3
-#   ./download_models.sh tts kokoro-en          # Download Kokoro English TTS
+# Usage:
+#   ./download_models.sh --list-asr              # List available ASR models
+#   ./download_models.sh --list-tts              # List available TTS models
+#   ./download_models.sh asr <model-name>        # Download specific ASR model
+#   ./download_models.sh tts <model-name>        # Download specific TTS model
+#   ./download_models.sh all                     # Download defaults
 
 set -e
 
 MODELS_DIR="${MODELS_DIR:-./models}"
-GITHUB_RELEASES="https://github.com/k2-fsa/sherpa-onnx/releases/download"
-HF_BASE="https://huggingface.co/k2-fsa/sherpa-onnx-tts"
+GITHUB_BASE="https://github.com/k2-fsa/sherpa-onnx/releases/download"
+GITHUB_API="https://api.github.com/repos/k2-fsa/sherpa-onnx/releases/tags"
 
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 info() { echo -e "${BLUE}[INFO]${NC} $1"; }
@@ -25,185 +31,192 @@ success() { echo -e "${GREEN}[OK]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
-# ============================================================================
-# ASR Models
-# ============================================================================
-
-declare -A ASR_MODELS=(
-    # Whisper models
-    ["whisper-tiny"]="asr-models/sherpa-onnx-whisper-tiny"
-    ["whisper-base"]="asr-models/sherpa-onnx-whisper-base"
-    ["whisper-small"]="asr-models/sherpa-onnx-whisper-small"
-    ["whisper-medium"]="asr-models/sherpa-onnx-whisper-medium"
-    ["whisper-large-v3"]="asr-models/sherpa-onnx-whisper-large-v3"
-    ["whisper-large-v3-turbo"]="asr-models/sherpa-onnx-whisper-large-v3-turbo"
-    
-    # SenseVoice (multilingual)
-    ["sensevoice"]="asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
-    
-    # Moonshine (fast, lightweight)
-    ["moonshine-tiny"]="asr-models/sherpa-onnx-moonshine-tiny-en-int8"
-    ["moonshine-base"]="asr-models/sherpa-onnx-moonshine-base-en-int8"
-    
-    # Paraformer (Chinese focused)
-    ["paraformer-zh"]="asr-models/sherpa-onnx-paraformer-zh-2023-09-14"
-    
-    # Zipformer Transducer (streaming capable)
-    ["zipformer-en"]="asr-models/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17"
-    ["zipformer-bilingual"]="asr-models/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20"
-)
+# Default models (commonly used)
+DEFAULT_ASR="sherpa-onnx-whisper-large-v3"
+DEFAULT_TTS="vits-piper-de_DE-thorsten-high"
 
 # ============================================================================
-# TTS Models
+# Fetch model list from GitHub API
 # ============================================================================
 
-declare -A TTS_MODELS=(
-    # Piper VITS models (various languages)
-    ["piper-de-thorsten"]="tts-models/vits-piper-de_DE-thorsten-high"
-    ["piper-en-lessac"]="tts-models/vits-piper-en_US-lessac-medium"
-    ["piper-en-libritts"]="tts-models/vits-piper-en_US-libritts_r-medium"
-    ["piper-fr-siwis"]="tts-models/vits-piper-fr_FR-siwis-medium"
-    ["piper-es-davefx"]="tts-models/vits-piper-es_ES-davefx-medium"
-    ["piper-it-riccardo"]="tts-models/vits-piper-it_IT-riccardo-x_low"
-    ["piper-nl-mls"]="tts-models/vits-piper-nl_NL-mls-medium"
-    ["piper-pl-gosia"]="tts-models/vits-piper-pl_PL-gosia-medium"
-    ["piper-pt-faber"]="tts-models/vits-piper-pt_BR-faber-medium"
-    ["piper-ru-irina"]="tts-models/vits-piper-ru_RU-irina-medium"
-    ["piper-zh-huayan"]="tts-models/vits-piper-zh_CN-huayan-medium"
+fetch_models() {
+    local tag=$1
+    local filter=${2:-""}
     
-    # Kokoro models (high quality, multi-speaker)
-    ["kokoro-en"]="tts-models/kokoro-en-v0_19"
-    ["kokoro-multi"]="tts-models/kokoro-multi-lang-v1_0"
+    info "Fetching model list from GitHub (tag: $tag)..."
     
-    # VITS MeloTTS
-    ["melo-zh-en"]="tts-models/vits-melo-tts-zh_en"
+    # Use GitHub API to get release assets
+    local url="${GITHUB_API}/${tag}"
+    local json
     
-    # Matcha models
-    ["matcha-en-ljspeech"]="tts-models/matcha-icefall-en_US-ljspeech"
-)
+    json=$(curl -sL -H "Accept: application/vnd.github+json" "$url" 2>/dev/null)
+    
+    if [[ -z "$json" ]] || echo "$json" | grep -q "rate limit"; then
+        warn "GitHub API rate limited or unavailable, using fallback method"
+        # Fallback: scrape the release page HTML
+        local html
+        html=$(curl -sL "https://github.com/k2-fsa/sherpa-onnx/releases/tag/${tag}" 2>/dev/null)
+        echo "$html" | grep -oP "(?<=/download/${tag}/)[^\"]+\.tar\.bz2" | sed 's/\.tar\.bz2$//' | sort -u
+        return
+    fi
+    
+    # Parse JSON to extract asset names
+    echo "$json" | grep -oP '"name":\s*"\K[^"]+\.tar\.bz2' | sed 's/\.tar\.bz2$//' | sort -u
+}
 
-# Default models
-DEFAULT_ASR="whisper-large-v3"
-DEFAULT_TTS="piper-de-thorsten"
-
-list_models() {
-    echo ""
-    echo "Available ASR Models:"
-    echo "====================="
-    for model in "${!ASR_MODELS[@]}"; do
-        if [[ "$model" == "$DEFAULT_ASR" ]]; then
-            echo "  $model (default)"
-        else
-            echo "  $model"
-        fi
-    done | sort
+list_asr_models() {
+    local filter=${1:-""}
     
     echo ""
-    echo "Available TTS Models:"
-    echo "====================="
-    for model in "${!TTS_MODELS[@]}"; do
-        if [[ "$model" == "$DEFAULT_TTS" ]]; then
-            echo "  $model (default)"
-        else
-            echo "  $model"
-        fi
-    done | sort
+    echo -e "${CYAN}Available ASR Models (from asr-models release):${NC}"
+    echo "================================================"
+    echo ""
+    
+    local models
+    models=$(fetch_models "asr-models")
+    
+    if [[ -n "$filter" ]]; then
+        echo "$models" | grep -i "$filter" || echo "No models matching '$filter'"
+    else
+        echo "$models" | column -c 100 2>/dev/null || echo "$models"
+    fi
+    
+    echo ""
+    echo -e "Total: $(echo "$models" | wc -l) models"
+    echo ""
+    echo -e "Common choices:"
+    echo "  sherpa-onnx-whisper-large-v3       (best accuracy, large)"
+    echo "  sherpa-onnx-whisper-turbo          (fast + accurate)"
+    echo "  sherpa-onnx-whisper-small          (balanced)"
+    echo "  sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17  (multilingual)"
+    echo "  sherpa-onnx-moonshine-base-en-int8 (ultra fast, English)"
     echo ""
 }
 
+list_tts_models() {
+    local filter=${1:-""}
+    
+    echo ""
+    echo -e "${CYAN}Available TTS Models (from tts-models release):${NC}"
+    echo "================================================"
+    echo ""
+    
+    local models
+    models=$(fetch_models "tts-models")
+    
+    if [[ -n "$filter" ]]; then
+        echo "$models" | grep -i "$filter" || echo "No models matching '$filter'"
+    else
+        echo "$models" | column -c 100 2>/dev/null || echo "$models"
+    fi
+    
+    echo ""
+    echo -e "Total: $(echo "$models" | wc -l) models"
+    echo ""
+    echo -e "Common choices:"
+    echo "  vits-piper-de_DE-thorsten-high     (German, high quality)"
+    echo "  vits-piper-en_US-lessac-medium     (English US)"
+    echo "  vits-piper-en_GB-alba-medium       (English UK)"
+    echo "  vits-coqui-en-ljspeech             (English, classic)"
+    echo "  kokoro-multi-lang-v1_0             (multi-language)"
+    echo ""
+}
+
+# ============================================================================
+# Download functions
+# ============================================================================
+
 download_model() {
-    local model_type=$1
+    local tag=$1
     local model_name=$2
-    local target_dir=$3
-    local model_path
+    local output_name=$3
     
-    if [[ "$model_type" == "asr" ]]; then
-        model_path="${ASR_MODELS[$model_name]}"
-        [[ -z "$model_path" ]] && error "Unknown ASR model: $model_name. Use --list to see available models."
-    else
-        model_path="${TTS_MODELS[$model_name]}"
-        [[ -z "$model_path" ]] && error "Unknown TTS model: $model_name. Use --list to see available models."
-    fi
+    # Remove .tar.bz2 if user included it
+    model_name="${model_name%.tar.bz2}"
     
-    local url="${GITHUB_RELEASES}/${model_path}.tar.bz2"
-    local tarball_name=$(basename "$model_path").tar.bz2
-    local dir_name=$(basename "$model_path")
+    local url="${GITHUB_BASE}/${tag}/${model_name}.tar.bz2"
+    local tarball="${model_name}.tar.bz2"
     
-    info "Downloading $model_name from $url"
+    info "Downloading: $model_name"
+    info "URL: $url"
     
-    mkdir -p "$target_dir"
-    cd "$target_dir"
+    mkdir -p "$MODELS_DIR"
+    cd "$MODELS_DIR"
     
-    # Download if not exists
-    if [[ ! -f "$tarball_name" ]]; then
-        if ! curl -L -o "$tarball_name" "$url" 2>/dev/null; then
-            # Try alternative URL format
-            url="${GITHUB_RELEASES}/v1.10.30/${dir_name}.tar.bz2"
-            info "Trying alternative URL: $url"
-            curl -L -o "$tarball_name" "$url" || error "Failed to download $model_name"
-        fi
-    else
+    # Download
+    if [[ -f "$tarball" ]]; then
         warn "Tarball already exists, skipping download"
-    fi
-    
-    # Extract
-    info "Extracting $tarball_name"
-    tar -xjf "$tarball_name"
-    
-    # Move contents to target (asr or tts subdirectory)
-    if [[ "$model_type" == "asr" ]]; then
-        rm -rf asr
-        mv "$dir_name" asr
     else
-        rm -rf tts
-        mv "$dir_name" tts
+        if ! curl -L -f --progress-bar -o "$tarball" "$url"; then
+            rm -f "$tarball"
+            error "Failed to download. Model may not exist: $model_name"
+        fi
     fi
     
-    # Cleanup tarball
-    rm -f "$tarball_name"
+    # Verify it's a valid bzip2 file
+    if ! file "$tarball" | grep -q "bzip2"; then
+        rm -f "$tarball"
+        error "Downloaded file is not a valid bzip2 archive"
+    fi
     
-    success "Downloaded $model_name to $target_dir/$model_type"
+    info "Extracting $tarball..."
+    tar -xjf "$tarball"
+    
+    # Move to output directory
+    rm -rf "$output_name"
+    mv "$model_name" "$output_name"
+    rm -f "$tarball"
+    
     cd - > /dev/null
+    success "Downloaded $model_name to $MODELS_DIR/$output_name"
 }
 
 download_asr() {
     local model="${1:-$DEFAULT_ASR}"
-    info "Downloading ASR model: $model"
-    download_model "asr" "$model" "$MODELS_DIR"
+    download_model "asr-models" "$model" "asr"
 }
 
 download_tts() {
     local model="${1:-$DEFAULT_TTS}"
-    info "Downloading TTS model: $model"
-    download_model "tts" "$model" "$MODELS_DIR"
+    download_model "tts-models" "$model" "tts"
 }
+
+# ============================================================================
+# Help and main
+# ============================================================================
 
 show_help() {
     echo "Wyoming Sherpa-ONNX Model Downloader"
     echo ""
-    echo "Usage: $0 [command] [model_name]"
+    echo "Usage: $0 <command> [options]"
     echo ""
     echo "Commands:"
-    echo "  all [asr_model] [tts_model]  Download ASR and TTS models (default: $DEFAULT_ASR, $DEFAULT_TTS)"
-    echo "  asr [model_name]             Download ASR model (default: $DEFAULT_ASR)"
-    echo "  tts [model_name]             Download TTS model (default: $DEFAULT_TTS)"
-    echo "  --list                       List all available models"
-    echo "  --help                       Show this help"
+    echo "  all [asr] [tts]          Download ASR and TTS models (defaults if omitted)"
+    echo "  asr <model-name>         Download specific ASR model"
+    echo "  tts <model-name>         Download specific TTS model"
+    echo "  --list-asr [filter]      List available ASR models (optionally filtered)"
+    echo "  --list-tts [filter]      List available TTS models (optionally filtered)"
+    echo "  --help                   Show this help"
     echo ""
     echo "Environment Variables:"
-    echo "  MODELS_DIR                   Directory to store models (default: ./models)"
+    echo "  MODELS_DIR               Directory to store models (default: ./models)"
     echo ""
     echo "Examples:"
-    echo "  $0 all                           # Download default models"
-    echo "  $0 asr whisper-large-v3          # Download Whisper large-v3"
-    echo "  $0 asr sensevoice                # Download SenseVoice (99 languages)"
-    echo "  $0 tts kokoro-en                 # Download Kokoro English TTS"
-    echo "  $0 tts piper-de-thorsten         # Download German Piper TTS"
+    echo "  $0 all                                    # Download defaults"
+    echo "  $0 asr sherpa-onnx-whisper-large-v3       # Download Whisper large-v3"
+    echo "  $0 asr sherpa-onnx-whisper-turbo          # Download Whisper turbo"
+    echo "  $0 tts vits-piper-en_US-lessac-medium     # Download English Piper"
+    echo "  $0 --list-asr whisper                     # List Whisper models"
+    echo "  $0 --list-tts piper-de                    # List German Piper models"
+    echo ""
+    echo "Model sources:"
+    echo "  ASR: https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models"
+    echo "  TTS: https://github.com/k2-fsa/sherpa-onnx/releases/tag/tts-models"
     echo ""
 }
 
 # Main
-case "${1:-all}" in
+case "${1:-}" in
     all)
         download_asr "${2:-$DEFAULT_ASR}"
         download_tts "${3:-$DEFAULT_TTS}"
@@ -213,15 +226,23 @@ case "${1:-all}" in
         echo "  TTS: $MODELS_DIR/tts"
         ;;
     asr)
-        download_asr "${2:-$DEFAULT_ASR}"
+        [[ -z "${2:-}" ]] && error "Model name required. Use --list-asr to see available models."
+        download_asr "$2"
         ;;
     tts)
-        download_tts "${2:-$DEFAULT_TTS}"
+        [[ -z "${2:-}" ]] && error "Model name required. Use --list-tts to see available models."
+        download_tts "$2"
         ;;
-    --list|-l)
-        list_models
+    --list-asr|-la)
+        list_asr_models "${2:-}"
+        ;;
+    --list-tts|-lt)
+        list_tts_models "${2:-}"
         ;;
     --help|-h)
+        show_help
+        ;;
+    "")
         show_help
         ;;
     *)

@@ -15,8 +15,11 @@ services:
       - ASR_MODEL=sensevoice
       - TTS_MODEL=vits-piper-de_DE-thorsten-high
       - TTS_SPEAKER_ID=0
-      # GPU acceleration
+      # GPU acceleration (can set independently for ASR/TTS)
       - USE_GPU=true
+      # Uncomment to run only ASR on GPU, TTS on CPU (saves VRAM):
+      # - ASR_GPU=true
+      # - TTS_GPU=false
       # Server URIs
       - ASR_URI=tcp://0.0.0.0:10300
       - TTS_URI=tcp://0.0.0.0:10400
@@ -26,9 +29,9 @@ services:
       # TTS (text-to-speech)
       - "10400:10400"
     volumes:
-      # ASR model (e.g., SenseVoice)
+      # ASR model (e.g., SenseVoice, Whisper)
       - ./models/asr:/app/models/asr:ro
-      # TTS model (e.g., VITS Piper German)
+      # TTS model (e.g., VITS Piper, Kokoro)
       - ./models/tts:/app/models/tts:ro
     deploy:
       resources:

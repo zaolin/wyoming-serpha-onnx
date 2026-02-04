@@ -2,9 +2,6 @@
 
 import asyncio
 import logging
-import os
-import tempfile
-import wave
 from typing import Any, Optional
 
 import numpy as np
@@ -39,9 +36,11 @@ class SherpaASREventHandler(AsyncEventHandler):
         self.model_lock = model_lock
 
         self.request_language: Optional[str] = None
-        self._wav_dir = tempfile.TemporaryDirectory()
-        self._wav_path = os.path.join(self._wav_dir.name, "speech.wav")
-        self._wav_file: Optional[wave.Wave_write] = None
+        # Store audio chunks directly in memory (more efficient than WAV file)
+        self._audio_chunks: list[bytes] = []
+        self._sample_rate: int = 16000
+        self._sample_width: int = 2
+        self._channels: int = 1
 
     async def handle_event(self, event: Event) -> bool:
         """Handle incoming Wyoming events."""
@@ -59,39 +58,59 @@ class SherpaASREventHandler(AsyncEventHandler):
 
         if AudioChunk.is_type(event.type):
             chunk = AudioChunk.from_event(event)
+            
+            # Store format from first chunk
+            if not self._audio_chunks:
+                self._sample_rate = chunk.rate
+                self._sample_width = chunk.width
+                self._channels = chunk.channels
 
-            if self._wav_file is None:
-                self._wav_file = wave.open(self._wav_path, "wb")
-                self._wav_file.setframerate(chunk.rate)
-                self._wav_file.setsampwidth(chunk.width)
-                self._wav_file.setnchannels(chunk.channels)
-
-            self._wav_file.writeframes(chunk.audio)
+            self._audio_chunks.append(chunk.audio)
             return True
 
         if AudioStop.is_type(event.type):
             _LOGGER.debug("Audio stopped, starting transcription")
 
-            if self._wav_file is None:
+            if not self._audio_chunks:
                 _LOGGER.warning("No audio received")
                 await self.write_event(Transcript(text="").event())
                 return False
 
-            self._wav_file.close()
-            self._wav_file = None
-
-            # Read audio file
             try:
-                import soundfile as sf
-
-                waveform, sample_rate = sf.read(self._wav_path, dtype="float32")
+                # Combine all chunks efficiently
+                audio_bytes = b"".join(self._audio_chunks)
+                total_samples = len(audio_bytes) // self._sample_width
+                
+                # Convert bytes to numpy array
+                if self._sample_width == 2:
+                    audio = np.frombuffer(audio_bytes, dtype=np.int16)
+                elif self._sample_width == 4:
+                    audio = np.frombuffer(audio_bytes, dtype=np.int32)
+                else:
+                    audio = np.frombuffer(audio_bytes, dtype=np.int16)
+                
+                # Free the bytes immediately
+                del audio_bytes
+                self._audio_chunks.clear()
+                
+                # Convert to float32
+                if audio.dtype == np.int16:
+                    waveform = audio.astype(np.float32) / 32768.0
+                elif audio.dtype == np.int32:
+                    waveform = audio.astype(np.float32) / 2147483648.0
+                else:
+                    waveform = audio.astype(np.float32)
+                
+                # Free the int audio array
+                del audio
 
                 # Make mono by averaging channels
-                if len(waveform.shape) > 1:
-                    waveform = np.mean(waveform, axis=1)
+                if self._channels > 1:
+                    waveform = waveform.reshape(-1, self._channels).mean(axis=1)
 
             except Exception as e:
-                _LOGGER.error("Failed to read audio: %s", e)
+                _LOGGER.error("Failed to process audio: %s", e)
+                self._audio_chunks.clear()
                 await self.write_event(Transcript(text=f"ERROR: {e}").event())
                 return False
 
@@ -100,7 +119,7 @@ class SherpaASREventHandler(AsyncEventHandler):
                 try:
                     text = self.engine.recognize(
                         waveform,
-                        sample_rate,
+                        self._sample_rate,
                         language=self.request_language,
                     )
                     _LOGGER.info("Transcribed: %s", text[:100] if text else "(empty)")
@@ -109,6 +128,9 @@ class SherpaASREventHandler(AsyncEventHandler):
                     _LOGGER.exception("Transcription failed")
                     await self.write_event(Transcript(text=f"ERROR: {e}").event())
                     return False
+                finally:
+                    # Free waveform after use
+                    del waveform
 
             await self.write_event(Transcript(text=text).event())
 

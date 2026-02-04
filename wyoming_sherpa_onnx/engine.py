@@ -16,6 +16,103 @@ SAMPLE_WIDTH = 2  # 16-bit
 CHANNELS = 1
 
 
+def get_gpu_memory_info() -> Tuple[int, int, int]:
+    """
+    Get available memory for GPU inference on Jetson.
+    
+    Jetson uses unified memory architecture where CPU and GPU share RAM.
+    Reports system memory as GPU memory.
+    
+    Returns:
+        Tuple of (total_mb, used_mb, free_mb)
+    """
+    try:
+        with open("/proc/meminfo", "r") as f:
+            meminfo = {}
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    key = parts[0].rstrip(":")
+                    value = int(parts[1]) // 1024  # Convert KB to MB
+                    meminfo[key] = value
+            
+            total = meminfo.get("MemTotal", 0)
+            free = meminfo.get("MemAvailable", meminfo.get("MemFree", 0))
+            used = total - free
+            
+            _LOGGER.debug("Jetson unified memory: total=%d MB, free=%d MB", total, free)
+            return total, used, free
+    except Exception as e:
+        _LOGGER.warning("Could not read /proc/meminfo: %s", e)
+    
+    return 0, 0, 0
+
+
+def estimate_model_size(model_path: Path) -> int:
+    """
+    Estimate model size in MB from ONNX files.
+    
+    Returns:
+        Estimated size in MB
+    """
+    total_bytes = 0
+    
+    # Sum all ONNX files
+    for onnx_file in model_path.glob("**/*.onnx"):
+        total_bytes += onnx_file.stat().st_size
+    
+    # Also count .weights files (used by Whisper)
+    for weights_file in model_path.glob("**/*.weights"):
+        total_bytes += weights_file.stat().st_size
+    
+    # Also count .bin files (Kokoro voices, etc)
+    for bin_file in model_path.glob("**/*.bin"):
+        total_bytes += bin_file.stat().st_size
+    
+    # Convert to MB and add overhead (~20% for GPU buffers)
+    size_mb = int((total_bytes / 1024 / 1024) * 1.2)
+    return size_mb
+
+
+def check_gpu_memory_for_models(
+    asr_path: Optional[Path], 
+    tts_path: Optional[Path],
+    min_free_mb: int = 500,
+) -> Tuple[bool, str]:
+    """
+    Check if there's enough GPU memory for the models.
+    
+    Returns:
+        Tuple of (ok, message)
+    """
+    total, used, free = get_gpu_memory_info()
+    
+    if total == 0:
+        return True, "GPU memory info not available, proceeding anyway"
+    
+    asr_size = estimate_model_size(asr_path) if asr_path and asr_path.exists() else 0
+    tts_size = estimate_model_size(tts_path) if tts_path and tts_path.exists() else 0
+    
+    required = asr_size + tts_size + min_free_mb
+    
+    _LOGGER.info(
+        "GPU memory: %d MB total, %d MB used, %d MB free",
+        total, used, free,
+    )
+    _LOGGER.info(
+        "Model sizes: ASR=%d MB, TTS=%d MB, required=%d MB (incl. %d MB buffer)",
+        asr_size, tts_size, required, min_free_mb,
+    )
+    
+    if required > free:
+        return False, (
+            f"Insufficient GPU memory: need ~{required} MB but only {free} MB free. "
+            f"Consider using smaller models or --use-gpu=false"
+        )
+    
+    return True, f"GPU memory OK: {free} MB free, ~{required} MB required"
+
+
 @dataclass
 class ASRConfig:
     """Configuration for ASR engine."""
@@ -78,6 +175,24 @@ class SherpaASREngine:
     def __init__(self, config: ASRConfig) -> None:
         self.config = config
         self._recognizer = None
+        self._model_type: Optional[str] = None
+        self._model_name: Optional[str] = None
+
+    @property
+    def model_type(self) -> Optional[str]:
+        """Return detected model type (whisper, sensevoice, etc)."""
+        return self._model_type
+
+    @property
+    def model_name(self) -> str:
+        """Return cleaned model name (without sherpa-onnx- prefix)."""
+        name = self._model_name or self.config.model_path.name
+        # Strip common prefixes
+        for prefix in ["sherpa-onnx-", "sherpa_onnx_"]:
+            if name.startswith(prefix):
+                name = name[len(prefix):]
+                break
+        return name
 
     def _detect_model_type(self, model_path: Path) -> Tuple[str, dict]:
         """
@@ -272,7 +387,9 @@ class SherpaASREngine:
         else:
             raise ValueError(f"Unknown model type: {model_type}")
         
-        _LOGGER.info("ASR model loaded successfully")
+        self._model_type = model_type
+        self._model_name = self.config.model_path.name
+        _LOGGER.info("ASR model loaded: %s (%s)", self._model_name, model_type)
 
     def recognize(
         self, audio: np.ndarray, sample_rate: int, language: Optional[str] = None
@@ -281,13 +398,15 @@ class SherpaASREngine:
         if self._recognizer is None:
             raise RuntimeError("ASR engine not loaded")
 
-        # Resample if needed
+        # Resample if needed (use numpy interp for speed, good enough for speech)
         if sample_rate != ASR_SAMPLE_RATE:
-            import scipy.signal
-
-            audio = scipy.signal.resample(
-                audio, int(len(audio) * ASR_SAMPLE_RATE / sample_rate)
-            )
+            duration = len(audio) / sample_rate
+            new_length = int(duration * ASR_SAMPLE_RATE)
+            
+            # Linear interpolation (fast and sufficient for speech)
+            old_indices = np.linspace(0, len(audio) - 1, len(audio))
+            new_indices = np.linspace(0, len(audio) - 1, new_length)
+            audio = np.interp(new_indices, old_indices, audio).astype(np.float32)
             sample_rate = ASR_SAMPLE_RATE
 
         # Ensure float32
@@ -312,6 +431,24 @@ class SherpaTTSEngine:
         self.config = config
         self._tts = None
         self.sample_rate = TTS_SAMPLE_RATE
+        self._model_type: Optional[str] = None
+        self._model_name: Optional[str] = None
+
+    @property
+    def model_type(self) -> Optional[str]:
+        """Return detected model type (vits, matcha, kokoro)."""
+        return self._model_type
+
+    @property
+    def model_name(self) -> str:
+        """Return cleaned model name (without vits-/sherpa-onnx- prefix)."""
+        name = self._model_name or self.config.model_path.name
+        # Strip common prefixes
+        for prefix in ["sherpa-onnx-", "sherpa_onnx_", "vits-"]:
+            if name.startswith(prefix):
+                name = name[len(prefix):]
+                break
+        return name
 
     def _detect_model_type(self, model_path: Path) -> Tuple[str, dict]:
         """
@@ -434,8 +571,10 @@ class SherpaTTSEngine:
         else:
             raise ValueError(f"Unknown TTS model type: {model_type}")
         
+        self._model_type = model_type
+        self._model_name = self.config.model_path.name
         self.sample_rate = self._tts.sample_rate
-        _LOGGER.info("TTS loaded, sample rate: %d", self.sample_rate)
+        _LOGGER.info("TTS loaded: %s (%s), sample rate: %d", self._model_name, model_type, self.sample_rate)
 
     def synthesize(self, text: str, speaker_id: Optional[int] = None) -> np.ndarray:
         """Synthesize speech from text."""

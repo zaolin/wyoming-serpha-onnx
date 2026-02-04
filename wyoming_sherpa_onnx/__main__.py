@@ -16,7 +16,10 @@ from wyoming.server import AsyncServer
 
 from . import SERVICE_NAME, __version__
 from .asr_handler import SherpaASREventHandler
-from .engine import ASRConfig, SherpaASREngine, SherpaTTSEngine, TTSConfig
+from .engine import (
+    ASRConfig, SherpaASREngine, SherpaTTSEngine, TTSConfig,
+    check_gpu_memory_for_models,
+)
 from .tts_handler import SherpaTTSEventHandler
 
 _LOGGER = logging.getLogger(__name__)
@@ -70,7 +73,19 @@ def parse_args() -> argparse.Namespace:
         "--use-gpu",
         action="store_true",
         default=os.environ.get("USE_GPU", "true").lower() == "true",
-        help="Use GPU acceleration",
+        help="Use GPU acceleration for both ASR and TTS (overridden by --asr-gpu/--tts-gpu)",
+    )
+    parser.add_argument(
+        "--asr-gpu",
+        type=lambda x: x.lower() == "true",
+        default=os.environ.get("ASR_GPU"),  # None if not set
+        help="Use GPU for ASR (true/false, overrides --use-gpu for ASR)",
+    )
+    parser.add_argument(
+        "--tts-gpu",
+        type=lambda x: x.lower() == "true",
+        default=os.environ.get("TTS_GPU"),  # None if not set
+        help="Use GPU for TTS (true/false, overrides --use-gpu for TTS)",
     )
     parser.add_argument(
         "--asr-only",
@@ -100,13 +115,123 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_asr_info() -> Info:
-    """Build Wyoming info for ASR service."""
+def detect_languages_from_model(model_name: str, model_type: str) -> list[str]:
+    """
+    Detect supported languages from model name.
+    
+    Returns list of language codes.
+    """
+    name_lower = model_name.lower()
+    
+    # Multilingual models
+    multilingual_patterns = [
+        "whisper",  # Whisper supports 99 languages
+        "sense-voice", "sensevoice",  # SenseVoice multilingual
+        "multi-lang", "multilingual", "multi_lang",
+        "zh-en", "en-zh", "bilingual",
+    ]
+    
+    if any(p in name_lower for p in multilingual_patterns):
+        # Return common language codes for multilingual models
+        return list(_LANGUAGE_CODES)
+    
+    # Language code patterns in model names (ISO format)
+    # Match patterns like: de_DE, en_US, zh_CN, fr-FR, etc.
+    import re
+    
+    lang_codes = set()
+    
+    # Pattern: xx_XX or xx-XX (e.g., de_DE, en-US)
+    matches = re.findall(r'[_-]([a-z]{2})[_-]([A-Z]{2})', model_name)
+    for lang, _ in matches:
+        lang_codes.add(lang)
+    
+    # Pattern: -xx- or _xx_ standalone language code
+    matches = re.findall(r'[_-]([a-z]{2})[_-]', name_lower)
+    for lang in matches:
+        if lang in ("de", "en", "fr", "es", "it", "zh", "ja", "ko", "ru", 
+                    "pl", "nl", "pt", "sv", "da", "no", "fi", "cs", "sk",
+                    "hu", "ro", "el", "tr", "ar", "he", "hi", "id", "th", "vi"):
+            lang_codes.add(lang)
+    
+    # Explicit language words
+    lang_map = {
+        "german": "de", "deutsch": "de",
+        "english": "en",
+        "french": "fr", "francais": "fr",
+        "spanish": "es", "espanol": "es",
+        "italian": "it", "italiano": "it",
+        "chinese": "zh", "mandarin": "zh",
+        "japanese": "ja",
+        "korean": "ko",
+        "russian": "ru",
+        "polish": "pl",
+        "dutch": "nl",
+        "portuguese": "pt",
+        "swedish": "sv",
+        "danish": "da",
+        "norwegian": "no",
+        "finnish": "fi",
+        "czech": "cs",
+        "slovak": "sk",
+        "hungarian": "hu",
+        "romanian": "ro",
+        "greek": "el",
+        "turkish": "tr",
+        "arabic": "ar",
+        "hebrew": "he",
+        "hindi": "hi",
+        "indonesian": "id",
+        "thai": "th",
+        "vietnamese": "vi",
+        "ukrainian": "uk",
+        "cantonese": "yue",
+    }
+    
+    for word, code in lang_map.items():
+        if word in name_lower:
+            lang_codes.add(code)
+    
+    # If no language detected, check model type defaults
+    if not lang_codes:
+        if model_type in ("moonshine",):
+            # Moonshine is English only
+            lang_codes.add("en")
+        elif model_type in ("paraformer",):
+            # Paraformer is Chinese focused
+            lang_codes.add("zh")
+        else:
+            # Default to English
+            lang_codes.add("en")
+    
+    return sorted(lang_codes)
+
+
+def build_asr_info(engine: "SherpaASREngine") -> Info:
+    """Build Wyoming info for ASR service with detected model info."""
+    model_type = engine.model_type or "unknown"
+    model_name = engine.model_name
+    
+    # Detect languages from model name
+    languages = detect_languages_from_model(model_name, model_type)
+    is_multilingual = len(languages) > 5
+    
+    # Determine description based on model type
+    descriptions = {
+        "whisper": f"Whisper {'multilingual' if is_multilingual else ''} ASR",
+        "sensevoice": "SenseVoice multilingual ASR (99 languages)",
+        "moonshine": "Moonshine fast ASR (English)",
+        "transducer": "Zipformer/Conformer transducer ASR",
+        "paraformer": "Paraformer ASR (Chinese)",
+        "ctc": "CTC-based ASR",
+    }
+    description = descriptions.get(model_type, f"{model_type} ASR")
+    
     return Info(
         asr=[
             AsrProgram(
                 name=SERVICE_NAME,
-                description="Sherpa-ONNX speech recognition",
+                description=f"Sherpa-ONNX: {description}",
                 attribution=Attribution(
                     name="k2-fsa",
                     url="https://github.com/k2-fsa/sherpa-onnx",
@@ -115,14 +240,14 @@ def build_asr_info() -> Info:
                 version=__version__,
                 models=[
                     AsrModel(
-                        name="sensevoice",
-                        description="Multilingual ASR (99 languages)",
+                        name=model_name,
+                        description=f"{model_type.capitalize()} model ({len(languages)} languages)",
                         attribution=Attribution(
-                            name="FunAudioLLM",
-                            url="https://github.com/FunAudioLLM/SenseVoice",
+                            name="sherpa-onnx",
+                            url="https://k2-fsa.github.io/sherpa/onnx/pretrained_models/index.html",
                         ),
                         installed=True,
-                        languages=list(_LANGUAGE_CODES),
+                        languages=languages,
                         version="1.0",
                     )
                 ],
@@ -131,13 +256,32 @@ def build_asr_info() -> Info:
     )
 
 
-def build_tts_info(speaker_id: int) -> Info:
-    """Build Wyoming info for TTS service."""
+def build_tts_info(engine: "SherpaTTSEngine", speaker_id: int) -> Info:
+    """Build Wyoming info for TTS service with detected model info."""
+    model_type = engine.model_type or "unknown"
+    model_name = engine.model_name
+    
+    # Detect languages from model name
+    languages = detect_languages_from_model(model_name, model_type)
+    is_multilingual = len(languages) > 1
+    
+    # Determine description based on model type
+    descriptions = {
+        "vits": "VITS/Piper neural TTS",
+        "matcha": "Matcha neural TTS",
+        "kokoro": "Kokoro multi-speaker TTS",
+    }
+    description = descriptions.get(model_type, f"{model_type} TTS")
+    
+    lang_desc = ", ".join(languages[:3])
+    if len(languages) > 3:
+        lang_desc += f" +{len(languages) - 3} more"
+    
     return Info(
         tts=[
             TtsProgram(
                 name=SERVICE_NAME,
-                description="Sherpa-ONNX text-to-speech",
+                description=f"Sherpa-ONNX: {description}",
                 attribution=Attribution(
                     name="k2-fsa",
                     url="https://github.com/k2-fsa/sherpa-onnx",
@@ -146,11 +290,14 @@ def build_tts_info(speaker_id: int) -> Info:
                 version=__version__,
                 voices=[
                     TtsVoice(
-                        name=str(speaker_id),
-                        description="Default voice",
-                        attribution=Attribution(name="Piper", url="https://github.com/rhasspy/piper"),
+                        name=model_name,
+                        description=f"{model_type.capitalize()} voice ({lang_desc})",
+                        attribution=Attribution(
+                            name="sherpa-onnx",
+                            url="https://k2-fsa.github.io/sherpa/onnx/tts/pretrained_models/index.html",
+                        ),
                         installed=True,
-                        languages=["de"],
+                        languages=languages,
                         version="1.0",
                     )
                 ],
@@ -165,7 +312,7 @@ async def run_asr_server(
     model_lock: asyncio.Lock,
 ) -> None:
     """Run ASR server."""
-    wyoming_info = build_asr_info()
+    wyoming_info = build_asr_info(engine)
     server = AsyncServer.from_uri(uri)
 
     _LOGGER.info("ASR server listening on %s", uri)
@@ -187,7 +334,7 @@ async def run_tts_server(
     speaker_id: int,
 ) -> None:
     """Run TTS server."""
-    wyoming_info = build_tts_info(speaker_id)
+    wyoming_info = build_tts_info(engine, speaker_id)
     server = AsyncServer.from_uri(uri)
 
     _LOGGER.info("TTS server listening on %s", uri)
@@ -230,17 +377,65 @@ async def main() -> None:
 
     tasks = []
 
+    # Determine GPU usage for each model
+    # Priority: --asr-gpu/--tts-gpu > ASR_GPU/TTS_GPU env > --use-gpu
+    def parse_gpu_flag(arg_value, env_name, default):
+        if arg_value is not None:
+            # CLI argument was provided
+            if isinstance(arg_value, str):
+                return arg_value.lower() == "true"
+            return bool(arg_value)
+        env_val = os.environ.get(env_name)
+        if env_val is not None:
+            return env_val.lower() == "true"
+        return default
+    
+    asr_use_gpu = parse_gpu_flag(args.asr_gpu, "ASR_GPU", args.use_gpu)
+    tts_use_gpu = parse_gpu_flag(args.tts_gpu, "TTS_GPU", args.use_gpu)
+    
+    # Check GPU memory for each model that will use GPU
+    asr_path = args.asr_model if not args.tts_only and args.asr_model.exists() else None
+    tts_path = args.tts_model if not args.asr_only and args.tts_model.exists() else None
+    
+    if asr_use_gpu and asr_path:
+        from .engine import get_gpu_memory_info, estimate_model_size
+        total, used, free = get_gpu_memory_info()
+        asr_size = estimate_model_size(asr_path)
+        if total > 0 and asr_size + 300 > free:
+            _LOGGER.warning(
+                "ASR model (~%d MB) may not fit in GPU memory (%d MB free), using CPU",
+                asr_size, free
+            )
+            asr_use_gpu = False
+        else:
+            _LOGGER.info("ASR will use GPU (model ~%d MB, %d MB free)", asr_size, free)
+    
+    if tts_use_gpu and tts_path:
+        from .engine import get_gpu_memory_info, estimate_model_size
+        total, used, free = get_gpu_memory_info()
+        tts_size = estimate_model_size(tts_path)
+        # Account for ASR if also using GPU
+        reserved = estimate_model_size(asr_path) if asr_use_gpu and asr_path else 0
+        if total > 0 and tts_size + reserved + 300 > free:
+            _LOGGER.warning(
+                "TTS model (~%d MB) may not fit in GPU memory (%d MB free, %d MB reserved for ASR), using CPU",
+                tts_size, free, reserved
+            )
+            tts_use_gpu = False
+        else:
+            _LOGGER.info("TTS will use GPU (model ~%d MB)", tts_size)
+
     # Initialize ASR
     asr_engine: Optional[SherpaASREngine] = None
     if not args.tts_only and args.asr_model.exists():
         asr_config = ASRConfig(
             model_path=args.asr_model,
-            use_gpu=args.use_gpu,
-            provider="cuda" if args.use_gpu else "cpu",
+            use_gpu=asr_use_gpu,
+            provider="cuda" if asr_use_gpu else "cpu",
         )
         asr_engine = SherpaASREngine(asr_config)
         await asr_engine.load()
-        _LOGGER.info("ASR engine loaded")
+        _LOGGER.info("ASR engine loaded (%s)", "GPU" if asr_use_gpu else "CPU")
 
         tasks.append(
             asyncio.create_task(
@@ -255,8 +450,8 @@ async def main() -> None:
     if not args.asr_only and args.tts_model.exists():
         tts_config = TTSConfig(
             model_path=args.tts_model,
-            use_gpu=args.use_gpu,
-            provider="cuda" if args.use_gpu else "cpu",
+            use_gpu=tts_use_gpu,
+            provider="cuda" if tts_use_gpu else "cpu",
             speaker_id=args.speaker_id,
         )
         tts_engine = SherpaTTSEngine(tts_config)
