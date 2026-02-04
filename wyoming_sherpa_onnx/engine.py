@@ -121,6 +121,7 @@ class ASRConfig:
     use_gpu: bool = True
     num_threads: int = 4
     provider: str = "cuda"  # cuda, cpu
+    language: str = ""  # Language code for Whisper (empty = auto-detect)
 
 
 @dataclass
@@ -146,6 +147,61 @@ def _find_file(model_path: Path, patterns: list[str]) -> Optional[Path]:
         if matches:
             return matches[0]
     return None
+
+
+def _detect_model_name(model_path: Path) -> str:
+    """
+    Detect model name from ONNX filenames in the model directory.
+    
+    Examples:
+    - large-v3-encoder.onnx -> whisper-large-v3
+    - model.onnx in sense-voice dir -> sensevoice
+    - vits-piper-de_DE-thorsten.onnx -> vits-piper-de_DE-thorsten
+    """
+    # Try to find encoder files (Whisper, Moonshine, etc.)
+    for encoder in model_path.glob("*-encoder.onnx"):
+        base = encoder.stem.replace("-encoder", "").replace(".int8", "")
+        if base:
+            return f"whisper-{base}" if not base.startswith("whisper") else base
+    
+    for encoder in model_path.glob("*encoder*.onnx"):
+        base = encoder.stem.replace("encoder", "").replace("_", "").replace(".int8", "")
+        if base and base not in ("", "-", "_"):
+            return base
+    
+    # Try to find model.onnx and derive name from directory parent or nearby files
+    model_onnx = model_path / "model.onnx"
+    if not model_onnx.exists():
+        model_onnx = model_path / "model.int8.onnx"
+    
+    if model_onnx.exists():
+        # Look for a descriptive tokens file or check parent directory name
+        for tokens in model_path.glob("*tokens*.txt"):
+            base = tokens.stem.replace("-tokens", "").replace("_tokens", "")
+            if base and base not in ("tokens",):
+                return base
+        
+        # Check if parent directory has a more descriptive name
+        parent = model_path.parent.name
+        if parent not in ("models", "asr", "tts", "app"):
+            return parent
+    
+    # Try to find any ONNX file with a descriptive name
+    for onnx_file in model_path.glob("*.onnx"):
+        name = onnx_file.stem.replace(".int8", "")
+        # Skip generic names
+        if name not in ("model", "encoder", "decoder", "joiner", "preprocessor", 
+                        "cached_decoder", "uncached_decoder"):
+            return name
+    
+    # Fallback to directory name but try parent if current is generic
+    dir_name = model_path.name
+    if dir_name in ("asr", "tts", "models"):
+        parent_name = model_path.parent.name
+        if parent_name not in ("app", "models", ""):
+            return parent_name
+    
+    return dir_name
 
 
 def _find_tokens(model_path: Path, base_name: Optional[str] = None) -> Optional[Path]:
@@ -329,10 +385,17 @@ class SherpaASREngine:
             )
         
         elif model_type == "whisper":
+            # IMPORTANT: task="transcribe" keeps original language
+            # task="translate" would translate everything to English
+            # language="" enables auto-detection, or set specific like "de"
+            whisper_lang = self.config.language or ""
+            _LOGGER.info("Whisper language: %s", whisper_lang if whisper_lang else "auto-detect")
             self._recognizer = sherpa_onnx.OfflineRecognizer.from_whisper(
                 encoder=config["encoder"],
                 decoder=config["decoder"],
                 tokens=config["tokens"],
+                language=whisper_lang,
+                task="transcribe",  # Transcribe (not translate to English)
                 num_threads=self.config.num_threads,
                 provider=provider,
             )
@@ -388,7 +451,7 @@ class SherpaASREngine:
             raise ValueError(f"Unknown model type: {model_type}")
         
         self._model_type = model_type
-        self._model_name = self.config.model_path.name
+        self._model_name = _detect_model_name(self.config.model_path)
         _LOGGER.info("ASR model loaded: %s (%s)", self._model_name, model_type)
 
     def recognize(
@@ -572,7 +635,7 @@ class SherpaTTSEngine:
             raise ValueError(f"Unknown TTS model type: {model_type}")
         
         self._model_type = model_type
-        self._model_name = self.config.model_path.name
+        self._model_name = _detect_model_name(self.config.model_path)
         self.sample_rate = self._tts.sample_rate
         _LOGGER.info("TTS loaded: %s (%s), sample rate: %d", self._model_name, model_type, self.sample_rate)
 
@@ -583,11 +646,55 @@ class SherpaTTSEngine:
 
         sid = speaker_id if speaker_id is not None else self.config.speaker_id
 
-        audio = self._tts.generate(
-            text,
-            sid=sid,
-            speed=self.config.speed,
-        )
+        # Split text into chunks to avoid model input limits
+        # VITS models often crash with very long inputs
+        import re
+        
+        # Split by sentence endings, keeping the punctuation
+        # This regex matches: (. or ? or ! or ;) followed by whitespace or end of string
+        chunks = re.split(r'([.?!;]+\s+)', text)
+        
+        # Recombine split parts (sentences + separators)
+        sentences = []
+        current_sentence = ""
+        for part in chunks:
+            current_sentence += part
+            # If part ends with punctuation/space or is the last part, verify and add
+            if re.search(r'[.?!;]+\s*$', part) or part == chunks[-1]:
+                if current_sentence.strip():
+                     sentences.append(current_sentence)
+                current_sentence = ""
+        
+        # If regex split failed to produce anything valid, fallback to original
+        if not sentences and text.strip():
+            sentences = [text]
 
-        return audio.samples
+        # Synthesize each sentence
+        all_samples = []
+        for sentence in sentences:
+            if not sentence.strip():
+                continue
+                
+            # If sentence is still unreasonably long, just try it (or we could split by comma)
+            # But usually sentence splitting is enough
+            
+            audio = self._tts.generate(
+                sentence,
+                sid=sid,
+                speed=self.config.speed,
+            )
+            if len(audio.samples) > 0:
+                all_samples.append(audio.samples)
+                
+                # Add a small silence between sentences (e.g., 200ms)
+                # 22050 Hz * 0.2s = 4410 samples
+                silence_duration = 0.2
+                silence_samples = int(self.sample_rate * silence_duration)
+                all_samples.append(np.zeros(silence_samples, dtype=np.float32))
+
+        if not all_samples:
+             return np.array([], dtype=np.float32)
+
+        # Concatenate all parts
+        return np.concatenate(all_samples)
 

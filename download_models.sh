@@ -5,6 +5,9 @@
 #   ASR: https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models
 #   TTS: https://github.com/k2-fsa/sherpa-onnx/releases/tag/tts-models
 #
+# IMPORTANT: Models must be compatible with the sherpa-onnx version installed!
+# Check SHERPA_ONNX_VERSION below and match it to your Docker image.
+#
 # Usage:
 #   ./download_models.sh --list-asr              # List available ASR models
 #   ./download_models.sh --list-tts              # List available TTS models
@@ -14,6 +17,12 @@
 
 set -e
 
+# ============================================================================
+#  VERSION CONFIGURATION - Must match the sherpa-onnx version in Dockerfile!
+# ============================================================================
+SHERPA_ONNX_VERSION="1.12.23"
+
+# Models directory and GitHub base URLs
 MODELS_DIR="${MODELS_DIR:-./models}"
 GITHUB_BASE="https://github.com/k2-fsa/sherpa-onnx/releases/download"
 GITHUB_API="https://api.github.com/repos/k2-fsa/sherpa-onnx/releases/tags"
@@ -31,9 +40,39 @@ success() { echo -e "${GREEN}[OK]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
-# Default models (commonly used)
-DEFAULT_ASR="sherpa-onnx-whisper-large-v3"
+# ============================================================================
+# Version-specific model recommendations
+# Models are published to asr-models/tts-models tags, but not all work with
+# all versions. This list shows verified compatible models per version.
+# ============================================================================
+
+# Models known to work with v1.12.x
+MODELS_V1_12_ASR="sherpa-onnx-whisper-turbo sherpa-onnx-whisper-large-v3 sherpa-onnx-whisper-small sherpa-onnx-moonshine-base-en-int8"
+MODELS_V1_12_TTS="vits-piper-de_DE-thorsten-high vits-piper-en_US-lessac-medium kokoro-multi-lang-v1_0"
+
+# Models requiring v1.13+ (newer SenseVoice format)
+MODELS_V1_13_ONLY="sherpa-onnx-sense-voice"
+
+# Default models (stable on current version)
+DEFAULT_ASR="sherpa-onnx-whisper-turbo"
 DEFAULT_TTS="vits-piper-de_DE-thorsten-high"
+
+# Check if model requires newer version
+check_model_compatibility() {
+    local model_name=$1
+    
+    # Check for known v1.13+ only models
+    for pattern in $MODELS_V1_13_ONLY; do
+        if [[ "$model_name" == *"$pattern"* ]]; then
+            local major_minor="${SHERPA_ONNX_VERSION%.*}"
+            if [[ "$major_minor" < "1.13" ]]; then
+                warn "Model '$model_name' may require sherpa-onnx v1.13+"
+                warn "You have v${SHERPA_ONNX_VERSION}. Proceeding anyway..."
+            fi
+            return
+        fi
+    done
+}
 
 # ============================================================================
 # Fetch model list from GitHub API
@@ -134,9 +173,13 @@ download_model() {
     # Remove .tar.bz2 if user included it
     model_name="${model_name%.tar.bz2}"
     
+    # Check version compatibility
+    check_model_compatibility "$model_name"
+    
     local url="${GITHUB_BASE}/${tag}/${model_name}.tar.bz2"
     local tarball="${model_name}.tar.bz2"
     
+    info "sherpa-onnx version: ${SHERPA_ONNX_VERSION}"
     info "Downloading: $model_name"
     info "URL: $url"
     
@@ -187,6 +230,7 @@ download_tts() {
 
 show_help() {
     echo "Wyoming Sherpa-ONNX Model Downloader"
+    echo "Sherpa-ONNX Version: ${SHERPA_ONNX_VERSION}"
     echo ""
     echo "Usage: $0 <command> [options]"
     echo ""
@@ -196,6 +240,7 @@ show_help() {
     echo "  tts <model-name>         Download specific TTS model"
     echo "  --list-asr [filter]      List available ASR models (optionally filtered)"
     echo "  --list-tts [filter]      List available TTS models (optionally filtered)"
+    echo "  --version                Show sherpa-onnx version"
     echo "  --help                   Show this help"
     echo ""
     echo "Environment Variables:"
@@ -208,6 +253,10 @@ show_help() {
     echo "  $0 tts vits-piper-en_US-lessac-medium     # Download English Piper"
     echo "  $0 --list-asr whisper                     # List Whisper models"
     echo "  $0 --list-tts piper-de                    # List German Piper models"
+    echo ""
+    echo -e "${YELLOW}Compatibility:${NC}"
+    echo "  Models must be compatible with sherpa-onnx v${SHERPA_ONNX_VERSION}"
+    echo "  SenseVoice models require v1.13+ for newer releases"
     echo ""
     echo "Model sources:"
     echo "  ASR: https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models"
@@ -241,6 +290,9 @@ case "${1:-}" in
         ;;
     --help|-h)
         show_help
+        ;;
+    --version|-v)
+        echo "sherpa-onnx version: ${SHERPA_ONNX_VERSION}"
         ;;
     "")
         show_help

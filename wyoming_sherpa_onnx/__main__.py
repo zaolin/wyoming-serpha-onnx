@@ -18,7 +18,7 @@ from . import SERVICE_NAME, __version__
 from .asr_handler import SherpaASREventHandler
 from .engine import (
     ASRConfig, SherpaASREngine, SherpaTTSEngine, TTSConfig,
-    check_gpu_memory_for_models,
+    get_gpu_memory_info, estimate_model_size,
 )
 from .tts_handler import SherpaTTSEventHandler
 
@@ -60,6 +60,19 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path(os.environ.get("TTS_MODEL_PATH", "/app/models/tts")),
         help="Path to TTS model directory",
+    )
+    # Optional language overrides (comma-separated, e.g., "de,en" or "de")
+    parser.add_argument(
+        "--asr-languages",
+        type=str,
+        default=os.environ.get("ASR_LANGUAGES", ""),
+        help="Override ASR languages (comma-separated, e.g., 'de,en')",
+    )
+    parser.add_argument(
+        "--tts-languages",
+        type=str,
+        default=os.environ.get("TTS_LANGUAGES", ""),
+        help="Override TTS languages (comma-separated, e.g., 'de')",
     )
 
     # Options
@@ -115,6 +128,50 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# Service name constants for Wyoming info
+SERVICE_NAME_ASR = "Sherpa ASR"
+SERVICE_NAME_TTS = "Sherpa TTS"
+
+
+def extract_voice_name(model_name: str) -> str:
+    """
+    Extract a friendly voice name from model path.
+    
+    Examples:
+    - vits-piper-de_DE-thorsten-high -> Thorsten (high)
+    - kokoro-v1.0 -> Kokoro v1.0
+    - whisper-large-v3 -> Whisper Large V3
+    """
+    import re
+    
+    # Remove common prefixes
+    name = model_name
+    for prefix in ["vits-piper-", "vits-", "piper-", "sherpa-onnx-"]:
+        if name.lower().startswith(prefix):
+            name = name[len(prefix):]
+            break
+    
+    # Extract quality variant (high, medium, low) if present
+    quality = ""
+    for q in ["high", "medium", "low", "hq", "lq"]:
+        if name.lower().endswith(f"-{q}"):
+            quality = q
+            name = name[:-len(q)-1]
+            break
+    
+    # Remove language prefix like de_DE- or en-US-
+    name = re.sub(r'^[a-z]{2}[_-][A-Z]{2}[_-]', '', name)
+    
+    # Title case the remaining name
+    voice_name = name.replace("-", " ").replace("_", " ").title()
+    
+    # Add quality variant if present
+    if quality:
+        voice_name = f"{voice_name} ({quality})"
+    
+    return voice_name
+
+
 def detect_languages_from_model(model_name: str, model_type: str) -> list[str]:
     """
     Detect supported languages from model name.
@@ -123,7 +180,13 @@ def detect_languages_from_model(model_name: str, model_type: str) -> list[str]:
     """
     name_lower = model_name.lower()
     
-    # Multilingual models
+    # Multilingual model types (always multilingual regardless of name)
+    multilingual_types = ["whisper", "sensevoice"]
+    if model_type.lower() in multilingual_types:
+        _LOGGER.debug("Model type '%s' is inherently multilingual", model_type)
+        return list(_LANGUAGE_CODES)
+    
+    # Multilingual patterns in model name
     multilingual_patterns = [
         "whisper",  # Whisper supports 99 languages
         "sense-voice", "sensevoice",  # SenseVoice multilingual
@@ -141,18 +204,22 @@ def detect_languages_from_model(model_name: str, model_type: str) -> list[str]:
     
     lang_codes = set()
     
-    # Pattern: xx_XX or xx-XX (e.g., de_DE, en-US)
-    matches = re.findall(r'[_-]([a-z]{2})[_-]([A-Z]{2})', model_name)
-    for lang, _ in matches:
-        lang_codes.add(lang)
+    # Pattern: xx_XX or xx-XX anywhere in name (e.g., de_DE, en-US, zh_CN)
+    # This matches patterns like "piper-de_DE-thorsten" -> "de"
+    matches = re.findall(r'([a-z]{2})[_-]([A-Z]{2})', model_name)
+    for lang, region in matches:
+        lang_codes.add(lang.lower())
+        _LOGGER.debug("Detected language from region code: %s_%s -> %s", lang, region, lang)
     
-    # Pattern: -xx- or _xx_ standalone language code
+    # Pattern: standalone language codes between separators
+    # Match -de- or _en_ patterns in lowercase model name
     matches = re.findall(r'[_-]([a-z]{2})[_-]', name_lower)
     for lang in matches:
         if lang in ("de", "en", "fr", "es", "it", "zh", "ja", "ko", "ru", 
                     "pl", "nl", "pt", "sv", "da", "no", "fi", "cs", "sk",
-                    "hu", "ro", "el", "tr", "ar", "he", "hi", "id", "th", "vi"):
+                    "hu", "ro", "el", "tr", "ar", "he", "hi", "id", "th", "vi", "uk", "yue"):
             lang_codes.add(lang)
+            _LOGGER.debug("Detected standalone language code: %s", lang)
     
     # Explicit language words
     lang_map = {
@@ -203,20 +270,26 @@ def detect_languages_from_model(model_name: str, model_type: str) -> list[str]:
         else:
             # Default to English
             lang_codes.add("en")
+            _LOGGER.warning("No language detected in model name '%s' (type=%s), defaulting to English", model_name, model_type)
     
-    return sorted(lang_codes)
+    result = sorted(lang_codes)
+    _LOGGER.info("Language detection for '%s' (%s): %s", model_name, model_type, result)
+    return result
 
 
-def build_asr_info(engine: "SherpaASREngine") -> Info:
+def build_asr_info(engine: "SherpaASREngine", language_override: str = "") -> Info:
     """Build Wyoming info for ASR service with detected model info."""
     model_type = engine.model_type or "unknown"
     model_name = engine.model_name
     
-    # Detect languages from model name
-    languages = detect_languages_from_model(model_name, model_type)
+    # Use language override if provided, otherwise detect from model
+    if language_override:
+        languages = [l.strip() for l in language_override.split(",") if l.strip()]
+        _LOGGER.info("Using ASR language override: %s", languages)
+    else:
+        languages = detect_languages_from_model(model_name, model_type)
     is_multilingual = len(languages) > 5
     
-    # Determine description based on model type
     descriptions = {
         "whisper": f"Whisper {'multilingual' if is_multilingual else ''} ASR",
         "sensevoice": "SenseVoice multilingual ASR (99 languages)",
@@ -227,10 +300,16 @@ def build_asr_info(engine: "SherpaASREngine") -> Info:
     }
     description = descriptions.get(model_type, f"{model_type} ASR")
     
-    return Info(
+    # Use clean constant name for HA (this is the "engine" or "program" name)
+    program_name = SERVICE_NAME_ASR
+    
+    # Friendly model name for display
+    friendly_model_name = extract_voice_name(model_name) if model_name else model_type.capitalize()
+    
+    info = Info(
         asr=[
             AsrProgram(
-                name=SERVICE_NAME,
+                name=program_name,
                 description=f"Sherpa-ONNX: {description}",
                 attribution=Attribution(
                     name="k2-fsa",
@@ -254,15 +333,21 @@ def build_asr_info(engine: "SherpaASREngine") -> Info:
             )
         ],
     )
+    _LOGGER.info("ASR Info: program='%s', model='%s', languages=%s", program_name, model_name, languages)
+    return info
 
 
-def build_tts_info(engine: "SherpaTTSEngine", speaker_id: int) -> Info:
+def build_tts_info(engine: "SherpaTTSEngine", speaker_id: int, language_override: str = "") -> Info:
     """Build Wyoming info for TTS service with detected model info."""
     model_type = engine.model_type or "unknown"
     model_name = engine.model_name
     
-    # Detect languages from model name
-    languages = detect_languages_from_model(model_name, model_type)
+    # Use language override if provided, otherwise detect from model
+    if language_override:
+        languages = [l.strip() for l in language_override.split(",") if l.strip()]
+        _LOGGER.info("Using TTS language override: %s", languages)
+    else:
+        languages = detect_languages_from_model(model_name, model_type)
     is_multilingual = len(languages) > 1
     
     # Determine description based on model type
@@ -277,10 +362,16 @@ def build_tts_info(engine: "SherpaTTSEngine", speaker_id: int) -> Info:
     if len(languages) > 3:
         lang_desc += f" +{len(languages) - 3} more"
     
-    return Info(
+    # Use clean constant name for HA (this is the "engine" or "program" name)
+    program_name = SERVICE_NAME_TTS
+    
+    # Friendly voice name for display (e.g., "Thorsten (high)")
+    voice_display_name = extract_voice_name(model_name) if model_name else model_type.capitalize()
+    
+    info = Info(
         tts=[
             TtsProgram(
-                name=SERVICE_NAME,
+                name=program_name,
                 description=f"Sherpa-ONNX: {description}",
                 attribution=Attribution(
                     name="k2-fsa",
@@ -290,8 +381,8 @@ def build_tts_info(engine: "SherpaTTSEngine", speaker_id: int) -> Info:
                 version=__version__,
                 voices=[
                     TtsVoice(
-                        name=model_name,
-                        description=f"{model_type.capitalize()} voice ({lang_desc})",
+                        name=model_name,  # Keep full name as ID for Wyoming protocol
+                        description=voice_display_name,  # Friendly name shown in HA
                         attribution=Attribution(
                             name="sherpa-onnx",
                             url="https://k2-fsa.github.io/sherpa/onnx/tts/pretrained_models/index.html",
@@ -304,15 +395,18 @@ def build_tts_info(engine: "SherpaTTSEngine", speaker_id: int) -> Info:
             )
         ],
     )
+    _LOGGER.info("TTS Info: program='%s', voice='%s' (%s), languages=%s", program_name, voice_display_name, model_name, languages)
+    return info
 
 
 async def run_asr_server(
     uri: str,
     engine: SherpaASREngine,
     model_lock: asyncio.Lock,
+    language_override: str = "",
 ) -> None:
     """Run ASR server."""
-    wyoming_info = build_asr_info(engine)
+    wyoming_info = build_asr_info(engine, language_override)
     server = AsyncServer.from_uri(uri)
 
     _LOGGER.info("ASR server listening on %s", uri)
@@ -332,9 +426,10 @@ async def run_tts_server(
     engine: SherpaTTSEngine,
     model_lock: asyncio.Lock,
     speaker_id: int,
+    language_override: str = "",
 ) -> None:
     """Run TTS server."""
-    wyoming_info = build_tts_info(engine, speaker_id)
+    wyoming_info = build_tts_info(engine, speaker_id, language_override)
     server = AsyncServer.from_uri(uri)
 
     _LOGGER.info("TTS server listening on %s", uri)
@@ -398,7 +493,6 @@ async def main() -> None:
     tts_path = args.tts_model if not args.asr_only and args.tts_model.exists() else None
     
     if asr_use_gpu and asr_path:
-        from .engine import get_gpu_memory_info, estimate_model_size
         total, used, free = get_gpu_memory_info()
         asr_size = estimate_model_size(asr_path)
         if total > 0 and asr_size + 300 > free:
@@ -411,7 +505,6 @@ async def main() -> None:
             _LOGGER.info("ASR will use GPU (model ~%d MB, %d MB free)", asr_size, free)
     
     if tts_use_gpu and tts_path:
-        from .engine import get_gpu_memory_info, estimate_model_size
         total, used, free = get_gpu_memory_info()
         tts_size = estimate_model_size(tts_path)
         # Account for ASR if also using GPU
@@ -428,10 +521,16 @@ async def main() -> None:
     # Initialize ASR
     asr_engine: Optional[SherpaASREngine] = None
     if not args.tts_only and args.asr_model.exists():
+        # Use first configured language for engine if specified
+        engine_lang = ""
+        if args.asr_languages:
+            engine_lang = args.asr_languages.split(",")[0].strip()
+
         asr_config = ASRConfig(
             model_path=args.asr_model,
             use_gpu=asr_use_gpu,
             provider="cuda" if asr_use_gpu else "cpu",
+            language=engine_lang,
         )
         asr_engine = SherpaASREngine(asr_config)
         await asr_engine.load()
@@ -439,7 +538,7 @@ async def main() -> None:
 
         tasks.append(
             asyncio.create_task(
-                run_asr_server(args.asr_uri, asr_engine, asr_lock)
+                run_asr_server(args.asr_uri, asr_engine, asr_lock, args.asr_languages)
             )
         )
     elif not args.tts_only:
@@ -460,7 +559,7 @@ async def main() -> None:
 
         tasks.append(
             asyncio.create_task(
-                run_tts_server(args.tts_uri, tts_engine, tts_lock, args.speaker_id)
+                run_tts_server(args.tts_uri, tts_engine, tts_lock, args.speaker_id, args.tts_languages)
             )
         )
     elif not args.asr_only:

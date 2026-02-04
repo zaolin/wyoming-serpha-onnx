@@ -7,7 +7,7 @@ from typing import Any, Optional
 import numpy as np
 
 from wyoming.asr import Transcribe, Transcript
-from wyoming.audio import AudioChunk, AudioStop
+from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.event import Event
 from wyoming.info import Describe, Info
 from wyoming.server import AsyncEventHandler
@@ -56,10 +56,20 @@ class SherpaASREventHandler(AsyncEventHandler):
             _LOGGER.debug("Language requested: %s", self.request_language)
             return True
 
+        if AudioStart.is_type(event.type):
+            # Reset buffer for new audio stream
+            audio_start = AudioStart.from_event(event)
+            self._audio_chunks = []
+            self._sample_rate = audio_start.rate
+            self._sample_width = audio_start.width
+            self._channels = audio_start.channels
+            _LOGGER.debug("Audio stream started (rate=%d, width=%d)", audio_start.rate, audio_start.width)
+            return True
+
         if AudioChunk.is_type(event.type):
             chunk = AudioChunk.from_event(event)
             
-            # Store format from first chunk
+            # Store format from first chunk if AudioStart wasn't sent
             if not self._audio_chunks:
                 self._sample_rate = chunk.rate
                 self._sample_width = chunk.width
