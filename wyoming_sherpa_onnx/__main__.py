@@ -68,6 +68,12 @@ def parse_args() -> argparse.Namespace:
         help="ASR mode (auto, offline, online). Detects automatically by default.",
     )
     parser.add_argument(
+        "--asr-languages",
+        type=str,
+        default=os.environ.get("ASR_LANGUAGES", ""),
+        help="Override ASR languages (comma-separated, e.g., 'de,en')",
+    )
+    parser.add_argument(
         "--tts-languages",
         type=str,
         default=os.environ.get("TTS_LANGUAGES", ""),
