@@ -639,14 +639,20 @@ class SherpaTTSEngine:
         self.sample_rate = self._tts.sample_rate
         _LOGGER.info("TTS loaded: %s (%s), sample rate: %d", self._model_name, model_type, self.sample_rate)
 
-    def _smart_split(self, text: str, max_len: int = 500) -> list[str]:
+    def _smart_split(self, text: str, max_len: int = 200) -> list[str]:
         """Recursively split text into chunks smaller than max_len."""
+        # Pre-clean: Remove markdown formatting that might confuse TTS
+        # Remove bold/italic markers
+        text = text.replace("**", "").replace("*", "")
+        
         if len(text) <= max_len:
             return [text]
         
-        # Try splitting by sentence endings
         import re
-        parts = re.split(r'([.?!;]+\s+)', text)
+        
+        # 1. Split by newlines (important for lists)
+        # Keep newlines as separators to preserve structure if needed, or just split
+        parts = re.split(r'(\n+)', text)
         chunks = []
         current = ""
         
@@ -654,28 +660,47 @@ class SherpaTTSEngine:
             if len(current) + len(part) <= max_len:
                 current += part
             else:
-                if current:
+                if current.strip():
                     chunks.append(current)
                 current = part
-        if current:
+        if current.strip():
             chunks.append(current)
             
-        # If splitting by proper sentences didn't help (still have big chunks)
-        # Try splitting by clauses (commas, colons)
-        final_chunks = []
+        # 2. Split by sentence endings (.?!)
+        # Recurse on chunks that are still too big
+        better_chunks = []
         for chunk in chunks:
+            if len(chunk) <= max_len:
+                better_chunks.append(chunk)
+                continue
+                
+            parts = re.split(r'([.?!;]+\s+)', chunk)
+            current = ""
+            for part in parts:
+                if len(current) + len(part) <= max_len:
+                    current += part
+                else:
+                    if current.strip():
+                        better_chunks.append(current)
+                    current = part
+            if current.strip():
+                better_chunks.append(current)
+
+        # 3. Split by clauses (,:—) for remaining big chunks
+        final_chunks = []
+        for chunk in better_chunks:
             if len(chunk) <= max_len:
                 final_chunks.append(chunk)
                 continue
                 
-            # Split by comma/colon
+            # Split by comma/colon/dash
             sub_parts = re.split(r'([,:—]+\s+)', chunk)
             sub_current = ""
             for part in sub_parts:
                 if len(sub_current) + len(part) <= max_len:
                     sub_current += part
                 else:
-                    if sub_current:
+                    if sub_current.strip():
                          # If even sub-chunk is too big, split by space
                         if len(sub_current) > max_len:
                             words = sub_current.split(' ')
@@ -684,15 +709,15 @@ class SherpaTTSEngine:
                                 if len(w_current) + len(word) + 1 <= max_len:
                                     w_current += (word + " ")
                                 else:
-                                    if w_current:
+                                    if w_current.strip():
                                         final_chunks.append(w_current.strip())
                                     w_current = word + " "
-                            if w_current:
+                            if w_current.strip():
                                 final_chunks.append(w_current.strip())
                         else:
                             final_chunks.append(sub_current)
                     sub_current = part
-            if sub_current:
+            if sub_current.strip():
                  # Check last piece
                 if len(sub_current) > max_len:
                     words = sub_current.split(' ')
@@ -701,10 +726,10 @@ class SherpaTTSEngine:
                         if len(w_current) + len(word) + 1 <= max_len:
                             w_current += (word + " ")
                         else:
-                            if w_current:
+                            if w_current.strip():
                                 final_chunks.append(w_current.strip())
                             w_current = word + " "
-                    if w_current:
+                    if w_current.strip():
                         final_chunks.append(w_current.strip())
                 else:
                     final_chunks.append(sub_current)
@@ -718,9 +743,9 @@ class SherpaTTSEngine:
 
         sid = speaker_id if speaker_id is not None else self.config.speaker_id
 
-        # Smart split text into chunks < 500 chars to avoid model crashes
-        # VITS models have hard input limits
-        sentences = self._smart_split(text, max_len=500)
+        # Smart split text into chunks < 200 chars to avoid model crashes
+        # Lowered limit to 200 for extra safety with markdown/lists
+        sentences = self._smart_split(text, max_len=200)
         
         # If somehow we still have no sentences
         if not sentences and text.strip():
@@ -741,8 +766,7 @@ class SherpaTTSEngine:
                 if len(audio.samples) > 0:
                     all_samples.append(audio.samples)
                     
-                    # Add a small silence between chunks (e.g., 100ms)
-                    # Reduced from 200ms to keep flow natural across comma splits
+                    # Add a small silence between chunks
                     silence_duration = 0.1
                     silence_samples = int(self.sample_rate * silence_duration)
                     all_samples.append(np.zeros(silence_samples, dtype=np.float32))
