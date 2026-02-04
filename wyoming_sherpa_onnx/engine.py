@@ -138,6 +138,11 @@ class SherpaASREngine:
         """Return the detected model type."""
         return self._model_type
 
+    @property
+    def model_name(self) -> str:
+        """Return the detected model name."""
+        return self._model_name
+
     def _detect_model_type(self, model_path: Path) -> tuple[str, dict]:
         """
         Detect model type and return type string + config dict.
