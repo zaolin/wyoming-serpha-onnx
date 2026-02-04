@@ -526,48 +526,54 @@ async def main() -> None:
     # Initialize ASR
     asr_engine: Optional[SherpaASREngine] = None
     if not args.tts_only and args.asr_model.exists():
-        # Use first configured language for engine if specified
-        engine_lang = ""
-        if args.asr_languages:
-            engine_lang = args.asr_languages.split(",")[0].strip()
+        try:
+            # Use first configured language for engine if specified
+            engine_lang = ""
+            if args.asr_languages:
+                engine_lang = args.asr_languages.split(",")[0].strip()
 
-        asr_config = ASRConfig(
-            model_path=args.asr_model,
-            use_gpu=asr_use_gpu,
-            provider="cuda" if asr_use_gpu else "cpu",
-            language=engine_lang,
-            mode=args.asr_mode,
-        )
-        asr_engine = SherpaASREngine(asr_config)
-        await asr_engine.load()
-        _LOGGER.info("ASR engine loaded (%s)", "GPU" if asr_use_gpu else "CPU")
-
-        tasks.append(
-            asyncio.create_task(
-                run_asr_server(args.asr_uri, asr_engine, asr_lock, args.asr_languages)
+            asr_config = ASRConfig(
+                model_path=args.asr_model,
+                use_gpu=asr_use_gpu,
+                provider="cuda" if asr_use_gpu else "cpu",
+                language=engine_lang,
+                mode=args.asr_mode,
             )
-        )
+            asr_engine = SherpaASREngine(asr_config)
+            await asr_engine.load()
+            _LOGGER.info("ASR engine loaded (%s)", "GPU" if asr_use_gpu else "CPU")
+
+            tasks.append(
+                asyncio.create_task(
+                    run_asr_server(args.asr_uri, asr_engine, asr_lock, args.asr_languages)
+                )
+            )
+        except Exception:
+            _LOGGER.exception("Failed to load ASR model")
     elif not args.tts_only:
         _LOGGER.warning("ASR model not found at %s", args.asr_model)
 
     # Initialize TTS
     tts_engine: Optional[SherpaTTSEngine] = None
     if not args.asr_only and args.tts_model.exists():
-        tts_config = TTSConfig(
-            model_path=args.tts_model,
-            use_gpu=tts_use_gpu,
-            provider="cuda" if tts_use_gpu else "cpu",
-            speaker_id=args.speaker_id,
-        )
-        tts_engine = SherpaTTSEngine(tts_config)
-        await tts_engine.load()
-        _LOGGER.info("TTS engine loaded")
-
-        tasks.append(
-            asyncio.create_task(
-                run_tts_server(args.tts_uri, tts_engine, tts_lock, args.speaker_id, args.tts_languages)
+        try:
+            tts_config = TTSConfig(
+                model_path=args.tts_model,
+                use_gpu=tts_use_gpu,
+                provider="cuda" if tts_use_gpu else "cpu",
+                speaker_id=args.speaker_id,
             )
-        )
+            tts_engine = SherpaTTSEngine(tts_config)
+            await tts_engine.load()
+            _LOGGER.info("TTS engine loaded")
+
+            tasks.append(
+                asyncio.create_task(
+                    run_tts_server(args.tts_uri, tts_engine, tts_lock, args.speaker_id, args.tts_languages)
+                )
+            )
+        except Exception:
+            _LOGGER.exception("Failed to load TTS model")
     elif not args.asr_only:
         _LOGGER.warning("TTS model not found at %s", args.tts_model)
 
