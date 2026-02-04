@@ -59,6 +59,8 @@ def parse_args() -> argparse.Namespace:
         "--tts-model",
         type=Path,
         default=Path(os.environ.get("TTS_MODEL_PATH", "/app/models/tts")),
+        help="Path to TTS model directory",
+    )
     parser.add_argument(
         "--asr-mode",
         choices=["auto", "offline", "online"],
