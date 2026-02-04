@@ -208,6 +208,7 @@ download_model() {
     # Move to output directory
     rm -rf "$output_name"
     mv "$model_name" "$output_name"
+    echo "$model_name" > "$output_name/.model_name"
     rm -f "$tarball"
     
     cd - > /dev/null

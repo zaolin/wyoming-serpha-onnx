@@ -147,9 +147,20 @@ class SherpaASREngine:
         """
         tokens = _find_file(model_path, ["tokens.txt", "*.txt"])
         
-        # 1. SenseVoice (multilingual)
+        # Check for .model_name file (created by download script)
+        model_name_file = model_path / ".model_name"
+        original_name = ""
+        if model_name_file.exists():
+            try:
+                original_name = model_name_file.read_text().strip().lower()
+                _LOGGER.debug("Found .model_name file: %s", original_name)
+            except Exception:
+                pass
+        
+        # Combine path and original name for detection
+        search_target = (str(model_path) + " " + original_name).lower()
         if _find_file(model_path, ["*sense-voice*", "*sensevoice*"]) or \
-           _find_file(model_path, ["model.onnx"]) and "sense" in str(model_path).lower():
+           _find_file(model_path, ["model.onnx"]) and "sense" in search_target:
              model = _find_file(model_path, ["model.onnx", "*.onnx"]) # Usually just model.onnx
              if model:
                  return "sensevoice", {
@@ -165,7 +176,7 @@ class SherpaASREngine:
             decoder = _find_file(model_path, ["*decoder.onnx", "*decoder*.onnx"])
             if encoder and decoder:
                 # Check for NeMo specific handling
-                if "nemo" in str(model_path).lower() or "nemo" in encoder.name.lower():
+                if "nemo" in search_target or "nemo" in encoder.name.lower():
                      return "nemo-transducer", {
                         "encoder": str(encoder),
                         "decoder": str(decoder),
@@ -214,7 +225,7 @@ class SherpaASREngine:
                  }
 
         # 6. NeMo CTC (single model.onnx but with 'nemo' in name/path)
-        if "nemo" in str(model_path).lower():
+        if "nemo" in search_target:
             model = _find_file(model_path, ["model.onnx", "*.onnx"])
             if model:
                 return "nemo-ctc", {
@@ -223,7 +234,7 @@ class SherpaASREngine:
                 }
 
         # 7. FireRedAsr (specific name pattern usually)
-        if "fire-red" in str(model_path).lower() or "firered" in str(model_path).lower():
+        if "fire-red" in search_target or "firered" in search_target:
              model = _find_file(model_path, ["model.onnx", "*.onnx"])
              if model:
                  return "fire-red-asr", {
@@ -232,7 +243,7 @@ class SherpaASREngine:
                  }
 
         # 8. Wenet CTC
-        if "wenet" in str(model_path).lower():
+        if "wenet" in search_target:
              model = _find_file(model_path, ["final.onnx", "model.onnx", "*.onnx"])
              if model:
                  return "wenet-ctc", {
