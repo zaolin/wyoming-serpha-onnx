@@ -164,6 +164,15 @@ class SherpaASREngine:
             encoder = _find_file(model_path, ["*encoder.onnx", "*encoder*.onnx"])
             decoder = _find_file(model_path, ["*decoder.onnx", "*decoder*.onnx"])
             if encoder and decoder:
+                # Check for NeMo specific handling
+                if "nemo" in str(model_path).lower() or "nemo" in encoder.name.lower():
+                     return "nemo-transducer", {
+                        "encoder": str(encoder),
+                        "decoder": str(decoder),
+                        "joiner": str(joiner),
+                        "tokens": str(tokens) if tokens else None
+                    }
+                
                 return "transducer", {
                     "encoder": str(encoder),
                     "decoder": str(decoder),
@@ -322,6 +331,15 @@ class SherpaASREngine:
                 )
             elif model_type == "transducer":
                 self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
+                    encoder=config["encoder"],
+                    decoder=config["decoder"],
+                    joiner=config["joiner"],
+                    tokens=config["tokens"],
+                    num_threads=self.config.num_threads,
+                    provider=provider,
+                )
+            elif model_type == "nemo-transducer":
+                 self._recognizer = sherpa_onnx.OfflineRecognizer.from_nemo_transducer(
                     encoder=config["encoder"],
                     decoder=config["decoder"],
                     joiner=config["joiner"],
